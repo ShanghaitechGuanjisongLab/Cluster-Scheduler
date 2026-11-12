@@ -1,0 +1,188 @@
+任务中间层 — 单节点动态任务中间层
+===================================
+
+在**一个已分配的 SLURM 节点**上随时添加/取消多个并行任务，无需节点级的重分配或释放。
+基于 [HyperQueue](https://github.com/It4innovations/hyperqueue) 0.20.0 封装。
+
+# 背景与选型
+
+需求：长驻作业（如 5 天的优化循环）内部，人工随时插队/取消若干并行计算（如 AF3 任务），不动 SLURM 作业本身。集群 QoS `MaxJobsPerUser=1` 使“动态 sbatch 小作业”不可行，登录节点常驻进程又因 cgroup 清理问题不可靠（见 Optimize-peptide-sequences/README.md），因此控制面必须落在**计算节点内的长驻作业**里。
+
+调研结论：
+
+| 候选 | 结论 |
+|---|---|
+| javanile/bpkg 平台（bpkg.sh 包目录）| 整个目录仅 46 个包，无任何任务队列/并行调度类工具，最接近的只是日文数据处理工具集 |
+| task-spooler / nq | 单机 FIFO 队列，无优先级、无 GPU 资源语义、取消能力弱 |
+| HyperQueue 0.20.0 | 动态提交（open job）、按 job 取消、优先级、GPU 非可分资源、单静态二进制、无需管理员权限——全部命中 |
+
+HyperQueue 版本选择的坑：官方最新 0.27.0 二进制需要 glibc 2.28+，本集群是 CentOS 7（glibc 2.17）跑不了；conda-forge 无此包；0.27 的 Python wheel 也是 manylinux_2_28。实测 **0.20.0 的官方二进制只依赖到 GLIBC_2.17**，可直接运行，故本目录固定使用 0.20.0（`bin/hq`）。
+
+已知怪癖：0.20.0 的 `--server-dir` 参数解析有 bug（传了值也报 "a value is required"），因此本封装全部改用环境变量 `HQ_SERVER_DIR`（官方文档认可的等价用法）。
+
+# 架构
+
+```
+登录节点                计算节点（一个 SLURM 作业内）
+                        任务守护.sh   ← exec 成为作业主体
+ 任务控制.sh              ├─ hq server（任务账本）
+   add/cancel/list  ───►  ├─ hq worker（执行体）
+   logs/info/wait         │   ├─ 任务1（GPU）
+   restart-service ───►   │   └─ 任务2（GPU）
+   service-status         └─ 受管服务（--run 指定的长驻进程）
+   stop/status               └ 可随时重启，作业与节点都不退出
+        │
+        └─ 凭据：运行状态/server/*/access.json（共享盘，两端可见）
+
+ 控制通道：add/cancel/list 走内网 TCP 连 server；restart-service/stop 走共享盘标志
+```
+
+- **一任务一 job**：0.20.0 的 `job cancel` 只能整 job 取消，故每个任务建独立 job，
+任务 ID 即 job ID。动态添加 = 新 submit，取消 = cancel 该 job，互不影响。
+- **GPU 分配**：worker 声明非可分资源 `--resource "gpus=[0,1,2,3]"`，任务请求
+`gpus=N` 后 HQ 把具体卡号放进 `HQ_RESOURCE_VALUES_gpus`，由 `任务包装.sh` 翻译成 `CUDA_VISIBLE_DEVICES`（HQ 不会自动设）。
+- **优先级**：每个任务通过 `--priority` 或 JSON 的 `priority` 附加整数标签，越大越先调度；同级按提交顺序。普通新任务用 0，上游可为补采任务赋更高等级。
+- **回填**：优先检查高优先级任务的资源匹配；放不下时继续检查后续任务，允许小任务使用小节点，不为空等大任务而占住小节点。已经运行的任务不被抢占。
+- **双轨启动**：可以保留大卡等待，同时提交小卡先启动。共享 `server.owner.lock` 保证仅一份守护启动 server 和业务编排；后来启动的作业只加入 worker，不清理已有状态，不重复写数据库。加入方空闲时自动退出。
+- **容错**：worker 崩溃自动重启（上限 10 次）；server 崩溃则 任务守护 退出，
+由外层作业/看门狗按既有策略续交。
+- **退出码语义**（exec 托管时守护的码就是 SLURM 作业码，故必须真实）：
+受管服务 0 → 守护也 0（COMPLETED）；受管服务反复崩溃超 `--max-restarts`、或 server/worker 意外退出 → 守护 1（FAILED）。若一律返回 0，sacct 会把崩溃作业记成 COMPLETED，看门狗与事后排查都会失真。
+
+# 受管服务：换代码而不释放计算节点
+
+为什么需要它：长驻作业把 Python 模块载入内存后，**改源文件对它无效**。若为了换新代码而 scancel 重交，就得重新排队——分区满载时可能等数小时（已实测踩过：释放的节点几分钟内就被其他人拿走）。把长驻进程交给守护托管后，换代码只需重启这个子进程：
+**作业不退出 → SLURM 分配不释放**。
+
+重启编排进程为何不浪费已跑的计算：计算跑在 hq worker 进程里，编排进程只是**提交者与等待者**。杀掉它不会中断任何在跑的任务，已完成的照常落盘；新进程起来后按结果目录与台账自行接管未完成部分。
+
+> ⚠️ **“接管”不是中间层自动完成的，需要上游配合。** 新进程若仅凭「磁盘上还没有产物」判断未完成，就会把**仍在队列里的同一个任务重新提交一遍**（单卡下等于双倍工时）。上游必须在提交前先查重：用 `任务控制.sh list --json` 取 `task_stats.running + waiting > 0` 的任务，命中同名者直接拿它的 `id` 去 `wait`，而不是再提一次。本项目实现见 `af3适配/af3任务.py:pending_jobs()` 与 `小肽优化_节点内.run_af3_cycle_hq()`，实测 restart-service 后队列 49 → 51（只增本轮补采；查重失效则会翻到 ~90）。
+>
+> 两个实测坑：HQ 0.27 的 json 输出**没有 `state` 字段**（字段为 `id`/`name`/`is_open`/`task_count`/`task_stats`），且 `is_open` 恒为 False，都不能当终态判据，只能数 `task_stats`。另外 SIGTERM 若正赶上编排阻塞在 `hq job wait`，Python 会按 PEP 475 重试而不退出，故 `--reload-timeout`（默认 25s）后的 SIGKILL 才是实际生效路径；这不损数据安全（结果已落盘，CSV 写入用 `os.replace` 原子替换）。
+
+两条重启路径（都不释放节点）：
+
+| 方式 | 时机 | 适用 |
+|---|---|---|
+| `任务控制.sh restart-service` | **立即**（SIGTERM，超时升级 SIGKILL） | 改动不影响正在收尾的数据；想马上换进程 |
+| 受管服务自己以重载码退出 | 受管服务自选的安全点 | 需要在业务边界干净收尾（如算完当前周期） |
+
+重载码默认 42（`--reload-code`）。受管服务退出码三态：`0` 收工（守护随之退出）、重载码→重启、其余→按 `--max-restarts` 自愈并在超限后以 1 退出。
+
+# 使用
+
+推荐形态：守护**充当作业主体**（exec），长驻进程由 `--run` 托管：
+
+```bash
+# sbatch 作业脚本末尾
+exec bash 任务守护.sh --gpus "$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)" \
+     --cpus "${SLURM_CPUS_PER_TASK:-$(nproc)}" \
+     --reload-code 42 \
+     --run "python -u 长驻主循环.py --targets A,B"
+```
+
+只提供 HQ、不托管长驻进程时（守护放后台）：
+
+```bash
+bash 任务守护.sh --gpus 0,1,2,3 --cpus 32 &
+# …主循环继续跑自己的事…
+```
+
+> GPU 数请直接探测，不要读 `CUDA_VISIBLE_DEVICES`：该变量由 SLURM prolog 注入，
+> 作业脚本开头求值时可能为空，`${CUDA_VISIBLE_DEVICES:-none}` 会静默回退成“无 GPU”
+> → worker 声明 0 卡 → 所有任务永远排队（2026-10-20 实测踩到）。
+
+客户端（登录节点，秒级即退）：
+
+GPU 任务必须同时声明数量和正数显存范围，例如 `--gpus 1 --gpu-memory 22:44`；JSON 使用 `"gpu_memory": [22,44]`，单位为每卡 GiB。单值表示上下限相同。
+未声明显存或显存为 0 时一律视为 CPU 任务，即使指定了 GPU 数量也不申请 GPU，
+且不会触发 GPU 自动扩容。不对旧队列补默认显存或迁移任务。
+
+节点每卡显存不小于上限时属于充足，原有调度策略不变；显存在下限（含）与上限（不含）之间时属于妥协，该节点上的有效优先级降低一级；低于下限时不参与该节点调度。降级后仍按优先级降序、job ID 升序，不能装下的任务不阻塞回填。多卡 worker 按每卡容量判断，不能将多张小卡显存相加绕过边界。任务执行时中间层提供 `TASKCTL_GPU_MEMORY_COMPROMISED=0/1`，由上游决定如何适应妥协。
+
+worker 按实际分配 GPU 声明 `gpumem`。AF3 上游默认将历史缺项标为
+`20 + 缺失靶标数`，统计补采标为 `20 + 样本缺口`，普通新候选为 0。
+中间层不解释业务缺口，任务派发和已有容量扣除按节点上的有效优先级及 FIFO 排序。Slurm 申请按分区独立逐档规划：从严格大于等待任务最大显存上限的最小实际档位开始向下；若不存在更大档位，则从该分区最大档位开始。每档最多一个分配请求，已有等待或运行档位不重复申请；达到提交名额、没有更多档位、没有更多等待任务，或后续档位均低于全部等待任务下限时停止。
+
+逐档申请按提交名额而非当前运行名额判断，已分配满的正常节点仍可排队；实际运行并发仍由 Slurm 限额控制。不限定某一台节点，也不限定同容量显卡的子型号，使用排除其他显存档节点的方式保持档位边界。待运行请求不再因等待超过 180 秒而撤销重提，避免丢失排队位置。
+扩容计划包含 `job_id` 和 `priority`，便于追踪；应用优先级不覆盖集群 Slurm 优先级。
+
+严格的异尺寸 FIFO 需要 `原生调度/FIFO.patch`，显存范围及节点相关降级还需要 `原生调度/显存范围.patch`：原版 HQ 会在同级任务间优先装入大任务，也不理解范围请求。
+补丁保留高 32 位用户优先级，在内部低 32 位加入反向 job ID，不改变 CLI/JSON 的等级标签。
+`原生调度/构建.sh` 在独立共享缓存准备工具链、离线编译，并运行
+`测试/test_hq_fifo.py` 的异尺寸 FIFO、回填和完整有符号等级测试；全部通过后才生成
+待切换的 `bin/hq.fifo`，不会自动替换 `bin/hq.native` 或重启在线服务。
+旧 server 不会因磁盘文件更新而加载新调度逻辑。切换必须等在途任务与业务统计收尾；
+现有旧守护把 server 退出当作故障，直接重启会结束 Slurm 分配，重新申请节点可能排队。
+
+```bash
+./任务控制.sh autoscale start
+./任务控制.sh autoscale status
+./任务控制.sh autoscale plan
+./任务控制.sh autoscale stop
+```
+
+```bash
+./任务控制.sh add --name seq0129_htr1a --gpus 1 --gpu-memory 5:10 --priority 10 -- \
+    bash 作业脚本/AF3打包推理.sh ...
+./任务控制.sh list
+./任务控制.sh list --json       # 机器可读；上游重启后据此接管而不重提
+./任务控制.sh cancel 5            # 或 ./任务控制.sh cancel seq0129_htr1a
+./任务控制.sh logs 5
+./任务控制.sh restart-service      # 立即重启受管服务（作业与节点不动）
+./任务控制.sh service-status       # 受管服务 pid / 重启次数 / 命令
+./任务控制.sh stop                # 让 任务守护 优雅退出
+```
+
+批量添加用 JSON（`add-json`）：
+
+```json
+{
+  "tasks": [
+    {"name": "t1", "gpus": 1, "gpu_memory": [22, 44], "priority": 10, "cmd": ["python", "run.py", "--id", "1"]},
+    {"name": "t2", "gpus": 0, "cmd": "python run.py --id 2"}
+  ]
+}
+```
+
+环境变量：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `TASKCTL_STATE` | `<本目录>/运行状态` | 状态/日志/凭据目录，须在共享盘上 |
+| `TASKCTL_AUTO_CPUS` | 8 | 扩容 worker 的目标 CPU 数，不超过节点和配额余量 |
+| `TASKCTL_AUTO_MEMORY` | 64G | 每张扩容 GPU 的主机内存请求，可按真实 RSS 峰值调节 |
+| `TASKCTL_AUTO_IDLE_TIMEOUT` | 5m | 加入 worker 的空闲释放时间 |
+| `TASKCTL_AUTO_JOB_NAMES` | 空 | 上游启动作业名，逗号分隔；其既有档位参与去重，不取消这些作业 |
+
+HQ 尚未启动时，上游可写共享状态目录的 `逐档启动.json`，字段为 `作业脚本`、`请求`（与 Request 对应的实际等待任务）、`保留作业` 和 `环境`，再执行 `python 自动扩容.py bootstrap`；`--仅计划` 只看计划。启动请求和在线扩容共用申请锁，不复制计算任务；启动作业应通过任务守护的共享选主锁避免多份编排。AF3 的启动入口及看门狗会自动生成需求、保留既有长驻请求，并在服务在线后恢复或复用扩容监控。
+
+所有扩容分配都从 Slurm 读取所选分区的 `MaxTime` 并申请最长时限，不再使用固定四小时或 `TASKCTL_AUTO_HOURS`。当前 `bme_gpu` 和 `bme_gpupub` 均申请五天；弹性 worker 的内部时限留两分钟收尾余量，不再默认四小时。空闲释放仍有效，最长时限是上限，不承诺作业运行满五天。
+
+运行额度只扣实际运行及收尾中的作业；`PENDING` 仅占提交槽，不消耗 GPU/CPU 运行额度。节点可申请主机内存还要扣 `MemSpecLimit`，不能只用 `CfgTRES-AllocTRES` 判断。
+混合显卡任务由实际 worker 的算力选择 attention：V100 为 xla 加 7.x 兼容标志，A100/H100 为 triton，不继承提交主节点的设备设置。显存需求仍由输入体系估算，不能为适配小卡而降低声明。
+
+本中间层是**通用任务调度工具**，不含任何具体任务的适配逻辑。目录：
+
+```
+任务中间层/
+├── bin/hq            # HyperQueue 0.27（在用; 0.20 备份于 bin/hq-0.20）
+├── bin/hq-0.27       # 0.27 源码编译版（CentOS 7 兼容, 从源码构建）
+├── 任务守护.sh        # 节点内 server+worker，可选 --run 托管长驻进程（长驻作业内拉起, 退出自动清理）
+├── 任务控制.sh        # 客户端 add/cancel/list/info/logs/wait/restart-service/service-status/stop/status
+└── 任务包装.sh        # GPU 卡号 → CUDA_VISIBLE_DEVICES 映射
+```
+
+# 接入方式（适配层在下游项目内）
+
+下游项目把自家任务转成 `任务控制.sh add ... -- <命令>` 即可接入，**任务适配层放在使用方自己的项目里**（如 AF3 的 `../Optimize-peptide-sequences/af3适配/`）：
+
+1. 长驻作业在计算节点内后台拉起 `任务守护.sh`（sbatch 作业脚本里启动，
+作业退出时自动清理）；
+2. 之后任何能访问共享盘 + 计算节点内网的节点都可用 `任务控制.sh` 控制任务；
+3. 每任务附上 `--priority` 标签（越大越先跑），普通任务 0，补采按缺口提高等级；
+4. 一任务一 job → `cancel <id>` 精确取消单个任务，不影响其余。
+
+注意任务资源供需匹配：任务请求的 cpus/gpus 必须 ≤ worker 声明的量，否则任务永远排队（如任务默认 `cpus=6` 则 worker 的 `--cpus` 需 ≥6）。
+
+# 使用

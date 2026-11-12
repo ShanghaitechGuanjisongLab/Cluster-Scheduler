@@ -1,0 +1,291 @@
+--- a/crates/hyperqueue/src/client/resources.rs
++++ b/crates/hyperqueue/src/client/resources.rs
+@@ -12,6 +12,11 @@
+ fn p_allocation_request() -> impl CharParser<AllocationRequest> {
+     parse_exact_string("all")
+         .map(|_| AllocationRequest::All)
++        .or(parse_resource_amount().then_ignore(just(":")).then(parse_resource_amount()).try_map(|(下限, 上限), span| {
++            let 请求 = AllocationRequest::显存范围(下限, 上限);
++            请求.validate().map_err(|错误| ParseError::custom(span, 错误.to_string()))?;
++            Ok(请求)
++        }))
+         .or(parse_resource_amount()
+             .padded()
+             .then(
+--- a/crates/tako/src/internal/common/priority.rs
++++ b/crates/tako/src/internal/common/priority.rs
+@@ -40,6 +40,10 @@
+         Self(value)
+     }
+ 
++    pub(crate) fn 显存排序键(self, 妥协: bool) -> u128 {
++        self.0 as u128 + (1u128 << 32) - ((妥协 as u128) << 32)
++    }
++
+     pub fn from_user_priority(user_priority: UserPriority) -> Self {
+         // We want to set user priority as high 32b bits (low bits are scheduler priority)
+         // We also need to invert sign bit (via ^0x8000_0000) to make sure to maintain ordering
+--- a/crates/tako/src/internal/common/resources/map.rs
++++ b/crates/tako/src/internal/common/resources/map.rs
+@@ -41,7 +41,7 @@
+                 .variants
+                 .iter()
+                 .map(|rq| {
+-                    ResourceRequest::new(
++                    let mut 请求 = ResourceRequest::new(
+                         rq.n_nodes,
+                         rq.min_time,
+                         rq.resources
+@@ -55,7 +55,9 @@
+                             })
+                             .collect(),
+                         rq.weight,
+-                    )
++                    );
++                    请求.设置显卡资源(self.resource_names.get("gpus").copied());
++                    请求
+                 })
+                 .collect(),
+         )
+--- a/crates/tako/src/internal/common/resources/request.rs
++++ b/crates/tako/src/internal/common/resources/request.rs
+@@ -18,10 +18,14 @@
+     ForceCompact(ResourceAmount),
+     ForceTight(ResourceAmount),
+     All,
++    显存范围(ResourceAmount, ResourceAmount),
+ }
+ 
+ impl AllocationRequest {
+     pub fn validate(&self) -> crate::Result<()> {
++        if let Self::显存范围(下限, 上限) = self && (下限.is_zero() || 下限 > 上限) {
++            return Err(DsError::GenericError("显存范围必须满足 0 < 下限 <= 上限".into()));
++        }
+         if self.amount_or_none_if_all().is_some_and(|a| a.is_zero()) {
+             Err(DsError::GenericError(
+                 "Zero resources cannot be requested".to_string(),
+@@ -42,6 +46,7 @@
+             | AllocationRequest::Tight(amount)
+             | AllocationRequest::ForceTight(amount)
+             | AllocationRequest::Scatter(amount) => Some(*amount),
++            AllocationRequest::显存范围(下限, _) => Some(*下限),
+             AllocationRequest::All => None,
+         }
+     }
+@@ -57,6 +62,7 @@
+             | AllocationRequest::Tight(amount)
+             | AllocationRequest::ForceTight(amount)
+             | AllocationRequest::Scatter(amount) => *amount,
++            AllocationRequest::显存范围(下限, _) => *下限,
+             AllocationRequest::All => all,
+         }
+     }
+@@ -68,6 +74,7 @@
+             | AllocationRequest::Tight(_)
+             | AllocationRequest::ForceTight(_) => true,
+             AllocationRequest::Scatter(_) | AllocationRequest::All => false,
++            AllocationRequest::显存范围(_, _) => false,
+         }
+     }
+ 
+@@ -78,6 +85,7 @@
+             | AllocationRequest::Tight(_)
+             | AllocationRequest::Scatter(_)
+             | AllocationRequest::All => false,
++            AllocationRequest::显存范围(_, _) => false,
+         }
+     }
+ }
+@@ -91,6 +99,7 @@
+             AllocationRequest::ForceTight(amount) => write!(f, "{amount} tight!"),
+             AllocationRequest::Scatter(amount) => write!(f, "{amount} scatter"),
+             AllocationRequest::All => write!(f, "all"),
++            AllocationRequest::显存范围(下限, 上限) => write!(f, "{下限}:{上限}"),
+         }
+     }
+ }
+@@ -148,6 +157,8 @@
+     min_time: TimeRequest,
+ 
+     weight: ResourceWeight,
++    #[serde(default)]
++    显卡资源: Option<ResourceId>,
+ }
+ 
+ impl ResourceRequest {
+@@ -163,6 +174,7 @@
+             resources,
+             min_time: time,
+             weight,
++            显卡资源: None,
+         }
+     }
+ 
+@@ -170,6 +182,30 @@
+         self.weight
+     }
+ 
++    pub(crate) fn 设置显卡资源(&mut self, 显卡资源: Option<ResourceId>) {
++        self.显卡资源 = 显卡资源;
++    }
++
++    fn 显存低于边界(&self, 节点资源: &WorkerResources, 检查上限: bool) -> bool {
++        let 任务卡数 = self.显卡资源.and_then(|资源| self.get_amount(资源)).map(|数量| 数量.total_fractions() as u128).unwrap_or(1).max(1);
++        let 节点卡数 = self.显卡资源.map(|资源| 节点资源.get(资源).total_fractions() as u128).unwrap_or(1).max(1);
++        self.resources.iter().any(|资源| {
++            if let AllocationRequest::显存范围(下限, 上限) = 资源.request {
++                let 边界 = if 检查上限 { 上限 } else { 下限 };
++                return 节点资源.get(资源.resource_id).total_fractions() as u128 * 任务卡数 < 边界.total_fractions() as u128 * 节点卡数;
++            }
++            false
++        })
++    }
++
++    pub(crate) fn 显存妥协(&self, 节点资源: &WorkerResources) -> bool {
++        self.显存低于边界(节点资源, true)
++    }
++
++    pub(crate) fn 显存不足(&self, 节点资源: &WorkerResources) -> bool {
++        self.显存低于边界(节点资源, false)
++    }
++
+     pub fn is_multi_node(&self) -> bool {
+         self.n_nodes > 0
+     }
+--- a/crates/tako/src/internal/scheduler/main.rs
++++ b/crates/tako/src/internal/scheduler/main.rs
+@@ -1,5 +1,5 @@
+ use crate::internal::scheduler::mapping::create_task_mapping;
+-use crate::internal::scheduler::{create_task_batches, run_scheduling_solver};
++use crate::internal::scheduler::{SchedulingSolution, create_task_batches, run_scheduling_solver};
+ use crate::internal::server::comm::{Comm, CommSender, CommSenderRef};
+ use crate::internal::server::core::{Core, CoreRef};
+ use std::rc::Rc;
+@@ -7,6 +7,43 @@
+ use tokio::sync::Notify;
+ use tokio::time::sleep;
+ 
++fn 调度显存妥协(core: &mut Core, comm: &mut impl Comm, now: Instant) {
++    let 显存资源 = core.resource_map().create_resource_id_map().get_index("gpumem");
++    let 有妥协 = {
++        let 部分 = core.split();
++        部分.task_queues.iter().filter(|队列| !队列.is_empty()).any(|队列| {
++            let 请求 = 部分.request_map.get(队列.resource_rq_id);
++            !请求.is_multi_node() && 部分.worker_map.get_workers().any(|节点| 节点.is_capable_to_run_rqv(请求, now) && 请求.requests().iter().any(|变体| 变体.显存妥协(&节点.resources)))
++        })
++    };
++    if !有妥协 {
++        return;
++    }
++    let mut 节点列表: Vec<_> = core.split().worker_map.get_workers().map(|节点| (std::cmp::Reverse(显存资源.map(|资源| 节点.resources.get(资源))), 节点.id)).collect();
++    节点列表.sort_unstable();
++    for (_, 节点编号) in 节点列表 {
++        loop {
++            let 选择 = {
++                let 部分 = core.split();
++                let 节点 = 部分.worker_map.get_worker(节点编号);
++                let Some(分配) = 节点.sn_assignment() else { break; };
++                部分.task_queues.iter().filter_map(|队列| {
++                    let 优先级 = 队列.top_priority()?;
++                    let 请求 = 部分.request_map.get(队列.resource_rq_id);
++                    if 请求.is_multi_node() || !节点.is_capable_to_run_rqv(请求, now) {
++                        return None;
++                    }
++                    请求.requests_with_ids().find(|(变体编号, 变体)| !节点.blocked_requests.contains(&(队列.resource_rq_id, *变体编号)) && 分配.free_resources.is_capable_to_run_request(变体)).map(|(变体编号, 变体)| (优先级.显存排序键(变体.显存妥协(&节点.resources)), 队列.resource_rq_id, 变体编号))
++                }).max_by_key(|候选| 候选.0)
++            };
++            let Some((_, 请求编号, 变体编号)) = 选择 else { break; };
++            let mut 方案 = SchedulingSolution::default();
++            方案.sn_counts.entry((请求编号, 变体编号)).or_default().insert(节点编号, 1);
++            create_task_mapping(core, 方案).send_messages(core, comm);
++        }
++    }
++}
++
+ pub(crate) async fn scheduler_loop(
+     core_ref: CoreRef,
+     comm_ref: CommSenderRef,
+@@ -52,6 +89,7 @@
+     comm: &mut impl Comm,
+     now: Instant,
+ ) -> SchedulerResult {
++    调度显存妥协(core, comm, now);
+     let batches = create_task_batches(core, now, None);
+     let solution = run_scheduling_solver(core, now, &batches, None);
+     let need_more_compute = if !solution.is_optimal {
+--- a/crates/tako/src/internal/scheduler/mapping.rs
++++ b/crates/tako/src/internal/scheduler/mapping.rs
+@@ -165,6 +165,13 @@
+         scheduler_state,
+         ..
+     } = core.split_mut();
++    let 有妥协 = task_queues.iter().filter(|队列| !队列.is_empty()).any(|队列| {
++        let 请求 = request_map.get(队列.resource_rq_id);
++        worker_map.get_workers().any(|节点| 请求.requests().iter().any(|变体| 节点.resources.is_capable_to_run_request(变体) && 变体.显存妥协(&节点.resources)))
++    });
++    if 有妥协 {
++        return;
++    }
+     let max_prefill = scheduler_state.config.proactive_filling_max as u64;
+     if max_prefill == 0 {
+         // Prefill explicitly disabled.
+--- a/crates/tako/src/internal/scheduler/mod.rs
++++ b/crates/tako/src/internal/scheduler/mod.rs
+@@ -9,7 +9,7 @@
+ 
+ pub(crate) use batches::{TaskBatch, create_task_batches};
+ pub(crate) use main::{SchedulerResult, run_scheduling, scheduler_loop};
+-pub(crate) use solver::run_scheduling_solver;
++pub(crate) use solver::{SchedulingSolution, run_scheduling_solver};
+ pub use state::SchedulerConfig;
+ pub(crate) use state::SchedulerState;
+ pub(crate) use taskqueue::TaskQueues;
+@@ -21,7 +21,4 @@
+ pub(crate) use mapping::{WorkerTaskMapping, create_task_mapping};
+ 
+ #[cfg(test)]
+-pub(crate) use solver::SchedulingSolution;
+-
+-#[cfg(test)]
+ pub(crate) use batches::PriorityCut;
+--- a/crates/tako/src/internal/server/workerload.rs
++++ b/crates/tako/src/internal/server/workerload.rs
+@@ -77,7 +77,7 @@
+     }
+ 
+     pub(crate) fn is_capable_to_run_request(&self, request: &ResourceRequest) -> bool {
+-        request.entries().iter().all(|r| {
++        !request.显存不足(self) && request.entries().iter().all(|r| {
+             let ask = r.request.min_amount();
+             let has = self.get(r.resource_id);
+             ask <= has
+--- a/crates/tako/src/internal/worker/resources/allocator.rs
++++ b/crates/tako/src/internal/worker/resources/allocator.rs
+@@ -136,6 +136,7 @@
+                 | AllocationRequest::Scatter(amount)
+                 | AllocationRequest::ForceCompact(amount)
+                 | AllocationRequest::ForceTight(amount) => *amount <= max_alloc,
++                AllocationRequest::显存范围(下限, _) => *下限 <= max_alloc,
+                 AllocationRequest::All => max_alloc == pool.full_size(),
+             }
+         }) {
+--- a/crates/tako/src/internal/worker/resources/pool.rs
++++ b/crates/tako/src/internal/worker/resources/pool.rs
+@@ -387,7 +387,7 @@
+     ) -> ResourceAllocation {
+         let pool = self.as_groups_mut();
+         let (amount, indices) = match policy {
+-            AllocationRequest::Compact(amount) | AllocationRequest::ForceCompact(amount) => (
++            AllocationRequest::Compact(amount) | AllocationRequest::ForceCompact(amount) | AllocationRequest::显存范围(amount, _) => (
+                 *amount,
+                 Self::claim_scatter_from_groups(*amount, pool, Some(group_set)),
+             ),
+@@ -434,7 +434,7 @@
+                         // This should be unreachable as this is always claimed via coupled solver
+                         unreachable!()
+                     }
+-                    AllocationRequest::Scatter(amount) => (
++                    AllocationRequest::Scatter(amount) | AllocationRequest::显存范围(amount, _) => (
+                         *amount,
+                         Self::claim_scatter_from_groups(*amount, pool, None),
+                     ),

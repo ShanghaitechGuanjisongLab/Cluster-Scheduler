@@ -1,0 +1,35 @@
+# Runtime state, credentials and logs
+/运行状态/
+logs/
+*.log
+*.log.*
+*.out
+*.err
+*.stdout
+*.stderr
+*.pid
+*.pid.lock
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Temporary files and editor backups
+tmp/
+temp/
+.cache/
+*.tmp
+*.tmp.*
+*.temp
+*.swp
+*.swo
+*~
+
+# Incomplete native binary builds
+bin
