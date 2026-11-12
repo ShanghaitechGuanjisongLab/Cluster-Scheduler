@@ -72,6 +72,10 @@ def 格式化队列(记录列表):
         妥协 = str(记录["妥协优先级"]) if 记录["妥协优先级"] is not None else "不适用"
         表格.append([str(记录["作业号"]), 记录["任务名"], str(记录["等待任务数"]), str(记录["资源方案"]), f"{记录['GPU数']:g}", 显存, str(记录["优先级"]), 妥协])
 
+    可选列 = {2: "等待任务数", 3: "资源方案", 4: "GPU数"}
+    显示列 = [列 for 列 in range(len(表格[0])) if 列 not in 可选列 or any(记录[可选列[列]] != 1 for 记录 in 记录列表)]
+    表格 = [[行[列] for 列 in 显示列] for 行 in 表格]
+
     def 显示宽度(文本):
         return sum(2 if unicodedata.east_asian_width(字符) in ("W", "F") else 1 for 字符 in 文本)
 

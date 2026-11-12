@@ -27,6 +27,22 @@ QUERY_SPEC.loader.exec_module(QUEUE_QUERY)
 
 
 class 队列查询测试(unittest.TestCase):
+    def test_三列分别仅在出现非一值时显示且不修改原始记录(self):
+        基础记录 = {"作业号": 1, "任务名": "测试任务", "等待任务数": 1, "资源方案": 1, "GPU数": 1.0, "每卡显存下限GiB": 22, "每卡显存上限GiB": 44, "优先级": 21, "妥协优先级": 20}
+        可选列 = ("等待数", "方案", "GPU数")
+        for 字段, 数值, 期望列 in ((None, None, ()), ("等待任务数", 2, ("等待数",)), ("资源方案", 2, ("方案",)), ("GPU数", 2, ("GPU数",)), ("GPU数", 0, ("GPU数",))):
+            with self.subTest(字段=字段, 数值=数值):
+                记录列表 = [dict(基础记录), dict(基础记录, 作业号=2)]
+                if 字段 is not None:
+                    记录列表[1][字段] = 数值
+                原数据 = json.dumps(记录列表)
+                表头 = QUEUE_QUERY.格式化队列(记录列表).splitlines()[0].split()
+                for 列 in 可选列:
+                    self.assertEqual(列 in 表头, 列 in 期望列)
+                self.assertIn("显存范围(GiB/卡)", 表头)
+                self.assertIn("优先级", 表头)
+                self.assertEqual(json.dumps(记录列表), 原数据)
+
     def test_只查询等待任务且按已提交优先级和FIFO排序(self):
         def 作业(编号, 优先级, 资源, 等待=1):
             return {"info": {"id": 编号, "name": f"任务{编号}", "task_stats": {"waiting": 等待}}, "submits": [{"array": {"priority": 优先级, "resources": [{"resources": 资源}]}}]}
