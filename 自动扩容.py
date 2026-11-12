@@ -254,6 +254,32 @@ def 可申请主机内存(配置, 已分配, 系统预留):
     return max(0, 配置.get("mem", 0) - 已分配.get("mem", 0) - int(系统预留 or 0))
 
 
+def 小卡任务边界让位(请求列表, 当前作业, 大卡作业列表, 剩余额度, 节点列表):
+    GPU请求 = [请求 for 请求 in 请求列表 if 请求.gpus > 0 and 请求.gpu_memory > 0]
+    当前显存 = 当前作业.get("gpu_memory") or 0
+    if not GPU请求 or 当前作业.get("state") != "RUNNING" or 当前显存 <= 0:
+        return None
+    最高请求 = min(GPU请求, key=lambda 请求: (-请求.priority, 请求.job_id))
+    充足显存 = 最高请求.显存上限 or 最高请求.gpu_memory
+    if 当前显存 >= 充足显存:
+        return None
+    for 大卡作业 in 大卡作业列表:
+        if 大卡作业.get("state") != "PENDING" or 大卡作业.get("account") != 当前作业.get("account") or 大卡作业.get("partition") != 当前作业.get("partition"):
+            continue
+        if (大卡作业.get("gpu_memory") or 0) < 充足显存 or 大卡作业.get("gpu", 0) < 最高请求.gpus or 大卡作业.get("cpu", 0) < 最高请求.cpus:
+            continue
+        for 节点 in 节点列表:
+            if 节点.partition != 大卡作业["partition"] or 节点.gpu_memory != 大卡作业["gpu_memory"]:
+                continue
+            分区额度键 = 当前作业.get("分区额度键")
+            if not 分区额度键 or 分区额度键 not in 节点.budget_keys or 剩余额度.get(分区额度键, {}).get("jobs", math.inf) != 0:
+                continue
+            if any((1 if 资源 == "jobs" else 大卡作业.get(资源, 0)) > 限额 + 已占用额度(当前作业, 资源) for 键 in 节点.budget_keys for 资源, 限额 in 剩余额度[键].items() if 资源 != "submit"):
+                continue
+            return {"释放作业": str(当前作业["id"]), "等待大卡作业": str(大卡作业["id"]), "分区": 当前作业["partition"], "当前显存": 当前显存, "大卡显存": 大卡作业["gpu_memory"], "最高优先级任务": 最高请求.job_id, "优先级": 最高请求.priority}
+    return None
+
+
 class Controller:
     def __init__(self, state=None, 启动模式=False):
         self.state = Path(state or os.environ.get("TASKCTL_STATE", HERE / "运行状态")).resolve()
@@ -321,7 +347,7 @@ class Controller:
                          "gpu": sum(map(int, counts)) * int(nodes), "node": int(nodes),
                          "mem": memory_mb(memory) * (int(cpus) if memory.endswith("c") else int(nodes)),
                          "name": name, "submit": submit, "reason": reason,
-                         "gpu_memory": 显存, "排除节点": sorted(排除节点)})
+                         "gpu_memory": 显存, "排除节点": sorted(排除节点), "通用显卡": gpu_type is None})
         return jobs
 
     def snapshot(self):
@@ -413,6 +439,7 @@ class Controller:
                     min(item.get("gpu", math.inf) for item in per_job),
                     min(item.get("mem", math.inf) for item in per_job), 最长时限=part.get("MaxTime", "UNLIMITED"), 配置CPU=configured.get("cpu", 0), 配置GPU=configured.get("gpu", 0), 配置主机内存=可申请主机内存(configured, {}, fields.get("MemSpecLimit", 0))))
         for 作业 in jobs:
+            作业["分区额度键"] = f"qos:{partitions.get(作业['partition'], {}).get('QoS', '')}"
             档位 = {节点.gpu_memory for 节点 in offers if 节点.partition == 作业["partition"] and 节点.node not in 作业.get("排除节点", set())}
             if 作业["gpu"] > 0 and 作业["gpu_memory"] is None and len(档位) == 1:
                 作业["gpu_memory"] = next(iter(档位))
@@ -488,6 +515,43 @@ class Controller:
               f"HQ={allocation['job_id']} priority={allocation['priority']} 最长时限={时限请求}", flush=True)
         return job_id
 
+    def 任务边界检查(self, 工作者编号, 已结束作业号, 任务尚未开始=False):
+        请求列表, 工作者列表, 任务详情 = self.demand()
+        if 工作者编号 is None:
+            编号列表 = {任务["worker"] for 详情 in 任务详情 if 详情["info"]["id"] == 已结束作业号 for 任务 in 详情.get("tasks", []) if 任务.get("state") == "running" and 任务.get("worker") is not None}
+            if len(编号列表) != 1:
+                raise ValueError("无法唯一确定任务所在worker，拒绝释放")
+            工作者编号 = 编号列表.pop()
+        if 任务尚未开始:
+            当前详情 = next((详情 for 详情 in 任务详情 if 详情["info"]["id"] == 已结束作业号), None)
+            if 当前详情 is None:
+                raise ValueError("启动边界任务不存在，拒绝释放")
+            待运行详情 = dict(当前详情, tasks=[dict(任务, state="waiting") for 任务 in 当前详情.get("tasks", []) if 任务.get("worker") == 工作者编号 and 任务.get("state") == "running"])
+            请求列表.extend(job_requests(待运行详情))
+        工作者 = next((条目 for 条目 in 工作者列表 if 条目["id"] == 工作者编号), None)
+        if 工作者 is None:
+            raise ValueError("任务边界的 worker 已不存在，拒绝释放")
+        分配号 = str((工作者.get("allocation") or {}).get("id", ""))
+        作业列表, 节点列表, 额度, _ = self.snapshot()
+        当前作业 = next((作业 for 作业 in 作业列表 if str(作业["id"]) == 分配号 and 作业["name"] == self.name), None)
+        if 当前作业 is None:
+            return None
+        if any(任务.get("worker") == 工作者编号 and 任务.get("state") == "running" and 详情["info"]["id"] != 已结束作业号 for 详情 in 任务详情 for 任务 in 详情.get("tasks", [])):
+            return None
+        保留作业号 = {str(编号) for 编号 in self.启动配置.get("保留作业", [])}
+        上游作业名 = set(filter(None, self.env.get("TASKCTL_AUTO_JOB_NAMES", "").split(",")))
+        大卡作业 = [作业 for 作业 in 作业列表 if 作业["name"] == self.name or 作业["name"] in 上游作业名 or str(作业["id"]) in 保留作业号]
+        决策 = 小卡任务边界让位(请求列表, 当前作业, 大卡作业, 额度, 节点列表)
+        if 决策:
+            决策["工作者"] = 工作者编号
+            记录目录 = self.state / "任务边界"
+            记录目录.mkdir(exist_ok=True)
+            路径 = 记录目录 / f"{分配号}.json"
+            临时路径 = 路径.with_suffix(f".tmp.{os.getpid()}")
+            临时路径.write_text(json.dumps({**决策, "已完成HQ作业": 已结束作业号, "时间": time.strftime("%F %T")}, ensure_ascii=False, indent=2), encoding="utf-8")
+            临时路径.replace(路径)
+        return 决策
+
     def upgrade_idle_workers(self, workers, details):
         if not (HERE / "bin" / "hq.native").exists():
             return False
@@ -532,10 +596,39 @@ class Controller:
         保留作业.update(str(作业["id"]) for 作业 in jobs if 作业["name"] in 上游作业名)
         保留作业.update(registered)
         保留作业.add(self.env.get("SLURM_JOB_ID", "") if hasattr(self, "env") else "")
-        已有档位 = {(作业["partition"], 作业["gpu_memory"]) for 作业 in jobs if 作业["account"] == getattr(self, "account", 作业["account"]) and (作业["name"].startswith(("hq-elastic-", "hq-bootstrap-")) or str(作业["id"]) in 保留作业)}
+        已有档位 = {(作业["partition"], 作业["gpu_memory"]) for 作业 in jobs if 作业["account"] == getattr(self, "account", 作业["account"]) and (作业["name"].startswith(("hq-elastic-", "hq-bootstrap-")) or str(作业["id"]) in 保留作业) and (作业.get("state", "PENDING") == "PENDING" or (作业.get("state") == "RUNNING" and str(作业["id"]) not in registered))}
         allocations = 逐档申请计划(requests, offers, budgets, 已有档位=已有档位, 每节点CPU=self.cpus, 每卡主机内存=self.memory_mb)
+        升级计划 = []
+        GPU请求 = [请求 for 请求 in requests if 请求.gpus > 0 and 请求.gpu_memory > 0]
+        剩余需求 = list(requests)
+        if GPU请求:
+            规划额度 = {名称: dict(数值, submit=math.inf) for 名称, 数值 in budgets.items()}
+            for 分区 in sorted({节点.partition for 节点 in offers}):
+                未覆盖GPU请求 = [请求 for 请求 in 剩余需求 if 请求.gpus > 0 and 请求.gpu_memory > 0]
+                if not 未覆盖GPU请求:
+                    break
+                最高请求 = min(未覆盖GPU请求, key=lambda 请求: (-请求.priority, 请求.job_id))
+                候选计划 = 逐档申请计划([最高请求], [节点 for 节点 in offers if 节点.partition == 分区], 规划额度, 每节点CPU=self.cpus, 每卡主机内存=self.memory_mb)
+                if not 候选计划:
+                    continue
+                大卡计划 = 候选计划[0]
+                节点 = 大卡计划["offer"]
+                if (分区, 节点.gpu_memory) in 已有档位 or any(分配["offer"].partition == 分区 and 分配["offer"].gpu_memory == 节点.gpu_memory for 分配 in allocations):
+                    continue
+                if all(budgets[键].get("submit", math.inf) >= 1 for 键 in 节点.budget_keys):
+                    continue
+                可升级 = [作业 for 作业 in owned if 作业["state"] == "PENDING" and 作业.get("通用显卡") and 作业["partition"] == 分区 and 0 < (作业.get("gpu_memory") or 0) < 节点.gpu_memory and 作业["gpu"] >= 大卡计划["gpus"] and 作业["cpu"] >= 最高请求.cpus and 作业["mem"] >= 大卡计划["memory_mb"]]
+                if 可升级:
+                    作业 = min(可升级, key=lambda 作业: (作业["gpu_memory"], int(作业["id"])))
+                    升级计划.append({"job_id": 作业["id"], "partition": 分区, "原显存": 作业["gpu_memory"], "gpu_memory": 节点.gpu_memory, "排除节点": 大卡计划["排除节点"], "需求任务": 最高请求.job_id})
+                    剩余需求.remove(最高请求)
+        if 升级计划:
+            allocations = 逐档申请计划(剩余需求, offers, budgets, 已有档位=已有档位, 每节点CPU=self.cpus, 每卡主机内存=self.memory_mb)
         cancelled = []
         if apply:
+            for 升级 in 升级计划:
+                self.run(["scontrol", "update", f"JobId={升级['job_id']}", "ExcNodeList=" + ",".join(升级["排除节点"])])
+                print(f"升级等待分配 {升级['job_id']}：{升级['partition']} {升级['原显存']}GiB → {升级['gpu_memory']}GiB，保留作业号，HQ需求={升级['需求任务']}", flush=True)
             for job in owned:
                 if job["state"] != "PENDING":
                     continue
@@ -551,6 +644,7 @@ class Controller:
                   "plan": [{**{key: value for key, value in item.items() if key != "offer"},
                             "node": item["offer"].node, "partition": item["offer"].partition,
                             "gpu_memory": item["offer"].gpu_memory} for item in allocations],
+                  "upgraded_pending": 升级计划,
                   "cancelled_pending": cancelled}
         if apply:
             temporary = self.status_file.with_suffix(f".tmp.{os.getpid()}")
@@ -626,11 +720,21 @@ def sys_python():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "once", "start", "stop", "status", "watch", "cleanup", "bootstrap"))
+    parser.add_argument("command", choices=("plan", "once", "start", "stop", "status", "watch", "cleanup", "bootstrap", "boundary"))
     parser.add_argument("--仅计划", action="store_true", help="启动模式只查看逐档计划，不提交 Slurm 作业")
+    parser.add_argument("--工作者", type=int)
+    parser.add_argument("--已结束作业", type=int)
+    parser.add_argument("--任务尚未开始", action="store_true")
     args = parser.parse_args()
     controller = Controller(启动模式=args.command == "bootstrap")
-    if args.command in ("plan", "once", "bootstrap"):
+    if args.command == "boundary":
+        if args.已结束作业 is None:
+            parser.error("任务边界检查必须指定 --已结束作业")
+        决策 = controller.任务边界检查(args.工作者, args.已结束作业, 任务尚未开始=args.任务尚未开始)
+        if 决策:
+            print(json.dumps(决策, ensure_ascii=False), flush=True)
+        return 75 if 决策 else 0
+    elif args.command in ("plan", "once", "bootstrap"):
         print(json.dumps(controller.tick(apply=args.command in ("once", "bootstrap") and not args.仅计划), ensure_ascii=False, indent=2))
     elif args.command == "start":
         print(f"扩容监控 HQ ID={controller.start()}")
@@ -647,4 +751,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

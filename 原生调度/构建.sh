@@ -40,13 +40,18 @@ case "${1:-}" in
         cargo --version
         cargo "${REGISTRY[@]}" fetch --locked --manifest-path "$SOURCE/Cargo.toml"
         ;;
-    导出补丁)
+    导出补丁|导出边界补丁)
         ORIGINAL=$(mktemp -d)
         PATCH_FILES=(crates/hyperqueue/src/client/resources.rs crates/tako/src/internal/common/priority.rs crates/tako/src/internal/common/resources/map.rs crates/tako/src/internal/common/resources/request.rs crates/tako/src/internal/scheduler/main.rs crates/tako/src/internal/scheduler/mapping.rs crates/tako/src/internal/scheduler/mod.rs crates/tako/src/internal/server/workerload.rs crates/tako/src/internal/worker/resources/allocator.rs crates/tako/src/internal/worker/resources/pool.rs)
+        PATCH_NAME=显存范围.patch
+        if [[ "$1" == 导出边界补丁 ]]; then
+            PATCH_FILES=(crates/tako/src/internal/worker/reactor.rs crates/tako/src/internal/worker/state.rs crates/tako/src/internal/worker/rpc.rs)
+            PATCH_NAME=任务边界.patch
+        fi
         ARCHIVE_FILES=()
         for file in "${PATCH_FILES[@]}"; do ARCHIVE_FILES+=("hyperqueue-0.27.0/$file"); done
         tar -xzf "$CACHE/hyperqueue-0.27.0.tar.gz" -C "$ORIGINAL" "${ARCHIVE_FILES[@]}"
-        PATCH_TMP=$(mktemp "$HERE/显存范围.patch.XXXXXX")
+        PATCH_TMP=$(mktemp "$HERE/$PATCH_NAME.XXXXXX")
         for file in "${PATCH_FILES[@]}"; do
             if diff -u --label "a/$file" --label "b/$file" "$ORIGINAL/hyperqueue-0.27.0/$file" "$SOURCE/$file" >> "$PATCH_TMP"; then
                 :
@@ -56,12 +61,13 @@ case "${1:-}" in
             fi
         done
         git -C "$SOURCE" apply --check --reverse "$PATCH_TMP"
-        mv "$PATCH_TMP" "$HERE/显存范围.patch"
+        mv "$PATCH_TMP" "$HERE/$PATCH_NAME"
         rm -rf "$ORIGINAL"
         ;;
     build)
         git -C "$SOURCE" apply --check --reverse "$HERE/FIFO.patch"
         git -C "$SOURCE" apply --check --reverse "$HERE/显存范围.patch"
+        git -C "$SOURCE" apply --check --reverse "$HERE/任务边界.patch"
         export LIBCLANG_PATH=/usr/lib64/clang-private
         export LD_LIBRARY_PATH="$LIBCLANG_PATH:$LD_LIBRARY_PATH"
         export CC="$AF3/bin/x86_64-conda-linux-gnu-cc"
@@ -76,7 +82,7 @@ case "${1:-}" in
         mv "$HOME_DIR/bin/hq.fifo.new" "$HOME_DIR/bin/hq.fifo"
         ;;
     *)
-        printf '用法：bash %s bootstrap|build|导出补丁\n' "$0" >&2
+        printf '用法：bash %s bootstrap|build|导出补丁|导出边界补丁\n' "$0" >&2
         exit 2
         ;;
 esac

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -20,9 +21,68 @@ SPEC.loader.exec_module(AUTOSCALE)
 GPU_SPEC = importlib.util.spec_from_file_location("gpu_worker", ROOT / "GPUworker.py")
 GPU_WORKER = importlib.util.module_from_spec(GPU_SPEC)
 GPU_SPEC.loader.exec_module(GPU_WORKER)
+QUERY_SPEC = importlib.util.spec_from_file_location("queue_query", ROOT / "查看队列.py")
+QUEUE_QUERY = importlib.util.module_from_spec(QUERY_SPEC)
+QUERY_SPEC.loader.exec_module(QUEUE_QUERY)
+
+
+class 队列查询测试(unittest.TestCase):
+    def test_只查询等待任务且按已提交优先级和FIFO排序(self):
+        def 作业(编号, 优先级, 资源, 等待=1):
+            return {"info": {"id": 编号, "name": f"任务{编号}", "task_stats": {"waiting": 等待}}, "submits": [{"array": {"priority": 优先级, "resources": [{"resources": 资源}]}}]}
+
+        范围资源 = [{"resource": "gpus", "request": {"Compact": 20000}}, {"resource": "gpumem", "request": {"显存范围": [650000, 1300000]}}]
+        固定资源 = [{"resource": "gpus", "request": {"Compact": 10000}}, {"resource": "gpumem", "request": {"Compact": 320000}}]
+        详情 = [作业(3, 21, 范围资源), 作业(2, 21, 固定资源), 作业(1, -2, [{"resource": "cpus", "request": {"Compact": 10000}}]), 作业(4, 100, 范围资源, 等待=0)]
+        调用 = []
+
+        def 查询(*参数):
+            调用.append(参数)
+            if 参数[1] == "list":
+                return [条目["info"] for 条目 in 详情]
+            return 详情
+
+        结果 = QUEUE_QUERY.读取等待任务(查询)
+        self.assertEqual([条目["作业号"] for 条目 in 结果], [2, 3, 1])
+        self.assertEqual(调用[-1], ("job", "info", "3,2,1"))
+        self.assertEqual((结果[1]["每卡显存下限GiB"], 结果[1]["每卡显存上限GiB"]), (32.5, 65))
+        self.assertEqual(结果[1]["妥协优先级"], 20)
+        self.assertIsNone(结果[0]["妥协优先级"])
+        self.assertEqual(结果[2]["GPU数"], 0)
+        文本 = QUEUE_QUERY.格式化队列(结果)
+        self.assertIn("32.5:65", 文本)
+        self.assertIn("CPU", 文本)
+        self.assertIn("共 3 个等待作业", 文本)
+
+    def test_空队列不查询详情且错误不被当作空队列(self):
+        调用 = []
+
+        def 空查询(*参数):
+            调用.append(参数)
+            return []
+
+        self.assertEqual(QUEUE_QUERY.读取等待任务(空查询), [])
+        self.assertEqual(len(调用), 1)
+        self.assertIn("没有等待任务", QUEUE_QUERY.格式化队列([]))
+
+        def 失败查询(*参数):
+            raise RuntimeError("服务离线")
+
+        with self.assertRaisesRegex(RuntimeError, "服务离线"):
+            QUEUE_QUERY.读取等待任务(失败查询)
 
 
 class GpuResourceTests(unittest.TestCase):
+    def test_旧worker边界查询异常不误停任务(self):
+        环境 = dict(os.environ, SLURM_JOB_ID="1", HQ_JOB_ID="2", HQ_RESOURCE_VALUES_gpus="0", TASKCTL_NATIVE_TASK_BOUNDARY="0")
+        for 错误 in (subprocess.TimeoutExpired("boundary", 120), OSError("服务离线")):
+            with self.subTest(错误=错误), patch.object(GPU_WORKER.subprocess, "run", side_effect=错误) as 查询:
+                GPU_WORKER.检查旧worker任务边界(环境)
+                self.assertEqual(查询.call_count, 1)
+        with patch.object(GPU_WORKER.subprocess, "run", return_value=subprocess.CompletedProcess([], 75, stdout="invalid", stderr="")) as 查询:
+            GPU_WORKER.检查旧worker任务边界(环境)
+            self.assertEqual(查询.call_count, 1)
+
     def test_任务包装按真实每卡显存标记妥协并拒绝不足(self):
         基础环境 = dict(os.environ, TASKCTL_HOME=str(ROOT), TASKCTL_PYTHON=sys.executable, TASKCTL_GPU_MEMORY_MIN_GB="22", TASKCTL_GPU_MEMORY_MAX_GB="44", HQ_RESOURCE_VALUES_gpus="1")
         for 显存, 标记 in ((22, "1"), (32, "1"), (44, "0"), (80, "0")):
@@ -119,6 +179,7 @@ class GpuResourceTests(unittest.TestCase):
             ["hq", "worker", "start", "--cpus", "8", "--resource", "gpus=[1]"], {}, output)
         self.assertIn("gpumem=sum(80)", command)
         self.assertEqual(environment["TASKCTL_GPU_COMPUTE_CAP"], "8.0")
+        self.assertEqual(json.loads(environment["TASKCTL_TASK_BOUNDARY_COMMAND"])[-1], "boundary")
         command, environment = GPU_WORKER.prepare(
             ["hq", "worker", "start", "--resource", "gpus=[0]"], {}, output)
         self.assertIn("gpumem=sum(32)", command)
@@ -203,6 +264,87 @@ class GpuResourceTests(unittest.TestCase):
 
 
 class PlanningTests(unittest.TestCase):
+    def test_边界检查仅标记可释放worker不取消Slurm且保护主服务(self):
+        with tempfile.TemporaryDirectory() as 目录:
+            控制器 = AUTOSCALE.Controller.__new__(AUTOSCALE.Controller)
+            控制器.state = Path(目录)
+            控制器.name = "hq-elastic-test"
+            控制器.启动配置, 控制器.env = {}, {}
+            请求 = [AUTOSCALE.Request(9, 6, 1, 22, priority=1199, 显存上限=44)]
+            当前 = {"id": "small", "name": 控制器.name, "account": "account", "partition": "gpu", "state": "RUNNING", "gpu_memory": 40, "gpu": 1, "cpu": 8, "mem": 32768, "分区额度键": "gpu"}
+            大卡 = dict(当前, id="large", state="PENDING", gpu_memory=80)
+            详情 = [{"info": {"id": 8}, "tasks": [{"worker": 2, "state": "running"}]}]
+            控制器.demand = lambda: (请求, [{"id": 2, "allocation": {"id": "small"}}], 详情)
+            控制器.snapshot = lambda: ([当前, 大卡], self.offers, {"gpu": {"jobs": 0, "gpu": 0, "cpu": 0}, "public": {}}, "")
+            控制器.run = lambda *参数: self.fail("边界检查不应自行取消Slurm或停止worker")
+            self.assertEqual(控制器.任务边界检查(2, 8)["等待大卡作业"], "large")
+            self.assertTrue((控制器.state / "任务边界" / "small.json").exists())
+            详情.append({"info": {"id": 10}, "tasks": [{"worker": 2, "state": "running"}]})
+            self.assertIsNone(控制器.任务边界检查(2, 8))
+            详情.pop()
+            当前["name"] = "pepopt-owner"
+            self.assertIsNone(控制器.任务边界检查(2, 8))
+
+    def test_小卡仅在同分区名额阻塞大卡时任务边界让位(self):
+        请求 = [AUTOSCALE.Request(9, 6, 1, 22, priority=1199, 显存上限=44), AUTOSCALE.Request(1, 6, 1, 5, priority=0, 显存上限=10)]
+        当前 = {"id": "small", "account": "account", "partition": "gpu", "state": "RUNNING", "gpu_memory": 40, "gpu": 1, "cpu": 8, "mem": 32768, "分区额度键": "gpu"}
+        大卡 = dict(当前, id="large", state="PENDING", gpu_memory=80)
+        额度 = {"gpu": {"jobs": 0, "gpu": 0, "cpu": 0, "submit": 0}, "public": {}}
+        决策 = AUTOSCALE.小卡任务边界让位(请求, 当前, [大卡], 额度, self.offers)
+        self.assertEqual((决策["释放作业"], 决策["等待大卡作业"], 决策["最高优先级任务"]), ("small", "large", 9))
+        for 当前值, 大卡列表, 请求值, 额度值 in ((当前, [], 请求, 额度), (当前, [dict(大卡, partition="public")], 请求, 额度), (当前, [dict(大卡, account="other")], 请求, 额度), (当前, [dict(大卡, state="RUNNING")], 请求, 额度), (当前, [大卡], [], 额度), (当前, [大卡], 请求[1:], 额度), (dict(当前, gpu_memory=80), [大卡], 请求, 额度), (当前, [大卡], 请求, {"gpu": {"jobs": 1}}), (当前, [dict(大卡, cpu=16)], 请求, 额度)):
+            with self.subTest(当前=当前值, 大卡=大卡列表, 请求=请求值, 额度=额度值):
+                self.assertIsNone(AUTOSCALE.小卡任务边界让位(请求值, 当前值, 大卡列表, 额度值, self.offers))
+
+    def test_名额已满时只原地升级自己的等待小卡不动运行或外部作业(self):
+        with tempfile.TemporaryDirectory() as 目录:
+            控制器 = AUTOSCALE.Controller.__new__(AUTOSCALE.Controller)
+            控制器.state = Path(目录)
+            控制器.status_file = 控制器.state / "autoscale.json"
+            控制器.name, 控制器.account = "hq-elastic-test", "test-account"
+            控制器.env = {"TASKCTL_AUTO_JOB_NAMES": "pepopt-loop"}
+            控制器.cpus, 控制器.memory_mb = 8, 32768
+            控制器.demand = lambda: ([AUTOSCALE.Request(9, 6, 1, 22, priority=1199, 显存上限=44)], [{"allocation": {"id": "1"}}], [])
+            运行 = {"id": "1", "name": "pepopt-loop", "account": 控制器.account, "partition": "gpu", "gpu_memory": 80, "state": "RUNNING", "gpu": 1, "cpu": 8, "mem": 32768, "通用显卡": True}
+            小卡 = dict(运行, id="2", name=控制器.name, gpu_memory=40, state="PENDING")
+            外部作业 = dict(小卡, id="3", name="cky-other")
+            作业列表 = [运行, 小卡, 外部作业]
+            控制器.snapshot = lambda: (作业列表, self.offers, {"gpu": {"submit": 0}, "public": {"submit": 1}}, "")
+            控制器.upgrade_idle_workers = lambda *参数: False
+            命令 = []
+            控制器.run = lambda 参数: 命令.append(参数)
+            结果 = 控制器.tick(apply=True)
+            self.assertEqual(命令, [["scontrol", "update", "JobId=2", "ExcNodeList=medium"]])
+            self.assertEqual(结果["upgraded_pending"][0]["gpu_memory"], 80)
+            self.assertEqual(结果["plan"], [])
+            self.assertEqual(结果["cancelled_pending"], [])
+            控制器.snapshot = lambda: (作业列表, self.offers, {"gpu": {"submit": 0}, "public": {"submit": 0}}, "")
+            作业列表[1] = dict(小卡, gpu_memory=80)
+            命令.clear()
+            self.assertEqual(控制器.tick(apply=True)["upgraded_pending"], [])
+            self.assertEqual(命令, [])
+            作业列表[1] = dict(小卡, state="RUNNING")
+            self.assertEqual(控制器.tick(apply=True)["upgraded_pending"], [])
+            self.assertEqual(命令, [])
+
+    def test_运行中大卡不阻止为剩余等待任务申请同档大卡(self):
+        控制器 = AUTOSCALE.Controller.__new__(AUTOSCALE.Controller)
+        控制器.name, 控制器.account = "hq-elastic-test", "test-account"
+        控制器.env = {"TASKCTL_AUTO_JOB_NAMES": "pepopt-loop"}
+        控制器.cpus, 控制器.memory_mb = 8, 32768
+        控制器.demand = lambda: ([AUTOSCALE.Request(3, 6, 1, 22, priority=1199, 显存上限=44)], [{"allocation": {"id": "running-large"}}], [])
+        运行作业 = {"id": "running-large", "name": "pepopt-loop", "account": 控制器.account, "partition": "gpu", "gpu_memory": 80, "state": "RUNNING"}
+        作业列表 = [运行作业]
+        控制器.snapshot = lambda: (作业列表, self.offers, {"gpu": {"submit": 1, "jobs": 0}, "public": {"submit": 0}}, "")
+        结果 = 控制器.tick()
+        self.assertEqual([(项["partition"], 项["gpu_memory"]) for 项 in 结果["plan"]], [("gpu", 80)])
+        作业列表.append(dict(运行作业, id="pending-large", name=控制器.name, state="PENDING"))
+        结果 = 控制器.tick()
+        self.assertEqual([(项["partition"], 项["gpu_memory"]) for 项 in 结果["plan"]], [("gpu", 40)])
+        作业列表.pop()
+        控制器.demand = lambda: ([], [{"allocation": {"id": "running-large"}}], [])
+        self.assertEqual(控制器.tick()["plan"], [])
+
     def test_通用GPU排队档位信息可写入JSON状态(self):
         控制器 = AUTOSCALE.Controller.__new__(AUTOSCALE.Controller)
         控制器.username = "test-user"

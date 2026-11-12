@@ -3,7 +3,10 @@
 import csv
 from decimal import Decimal, InvalidOperation
 import io
+import json
 import os
+from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -65,6 +68,36 @@ def 显存运行环境(环境):
     return 结果
 
 
+def 检查旧worker任务边界(环境):
+    if 环境.get("TASKCTL_NATIVE_TASK_BOUNDARY") == "1" or not all(环境.get(键) for 键 in ("SLURM_JOB_ID", "HQ_JOB_ID", "HQ_RESOURCE_VALUES_gpus")):
+        return
+    默认命令 = [环境.get("TASKCTL_PYTHON", sys.executable), str(Path(__file__).resolve().with_name("自动扩容.py")), "boundary"]
+    命令 = json.loads(环境["TASKCTL_TASK_BOUNDARY_COMMAND"]) if 环境.get("TASKCTL_TASK_BOUNDARY_COMMAND") else 默认命令
+    参数 = [*命令, "--已结束作业", 环境["HQ_JOB_ID"], "--任务尚未开始"]
+    if 环境.get("HQ_WORKER_ID"):
+        参数.extend(["--工作者", 环境["HQ_WORKER_ID"]])
+    try:
+        结果 = subprocess.run(参数, env=环境, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as 错误:
+        print(f"任务启动边界检查异常，保留节点继续计算：{错误}", file=sys.stderr, flush=True)
+        return
+    if 结果.returncode == 0:
+        return
+    if 结果.returncode != 75:
+        print("任务启动边界检查失败，保留节点继续计算：" + 结果.stderr.strip(), file=sys.stderr, flush=True)
+        return
+    try:
+        决策 = json.loads(结果.stdout)
+        工作者编号 = int(决策["工作者"])
+    except (ValueError, KeyError, TypeError) as 错误:
+        print(f"任务启动边界决策无效，保留节点继续计算：{错误}", file=sys.stderr, flush=True)
+        return
+    print("上一任务已结束，为等待大卡释放旧worker；本任务尚未开始，交回HQ等待", flush=True)
+    subprocess.run([str(Path(__file__).resolve().parent / "bin" / "hq"), "worker", "stop", str(工作者编号)], env=环境, check=True, timeout=30)
+    while True:
+        signal.pause()
+
+
 def prepare_submission(arguments):
     arguments = list(arguments)
     boundary = arguments.index("--") if "--" in arguments else len(arguments)
@@ -118,6 +151,8 @@ def prepare(arguments, environ, query_output):
         arguments += ["--resource", f"gpumem=sum({memory * len(resource)})"]
     environment = dict(environ, TASKCTL_GPU_MEMORY_GB=str(memory),
                        TASKCTL_GPU_COMPUTE_CAP=str(capability))
+    environment["TASKCTL_TASK_BOUNDARY_COMMAND"] = json.dumps([environ.get("TASKCTL_PYTHON", sys.executable), str(Path(__file__).resolve().with_name("自动扩容.py")), "boundary"], ensure_ascii=False)
+    environment["TASKCTL_NATIVE_TASK_BOUNDARY"] = "1"
     if "--cpus" in arguments:
         environment["TASKCTL_WORKER_CPUS"] = arguments[arguments.index("--cpus") + 1]
     return arguments, environment
@@ -128,6 +163,7 @@ def main():
         if len(sys.argv) < 3:
             raise SystemExit("缺少待执行任务命令")
         环境 = 显存运行环境(os.environ)
+        检查旧worker任务边界(环境)
         os.execvpe(sys.argv[2], sys.argv[2:], 环境)
     arguments = prepare_submission(sys.argv[1:])
     if not arguments:

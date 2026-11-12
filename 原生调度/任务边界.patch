@@ -1,0 +1,114 @@
+--- a/crates/tako/src/internal/worker/reactor.rs
++++ b/crates/tako/src/internal/worker/reactor.rs
+@@ -17,6 +17,11 @@
+ use tokio::sync::oneshot;
+ 
+ pub(crate) fn compute_tasks(state: &mut WorkerState, mut msg: ComputeTasksMsg) {
++    if state.任务边界让位 {
++        let 更新 = msg.tasks.into_iter().map(|任务| WorkerTaskUpdate::RejectRequest { task_id: 任务.id, rv_id: 任务.resource_rq_variant }).collect();
++        state.comm().send_message_to_server(FromWorkerMessage::TaskUpdate(更新));
++        return;
++    }
+     let task_count = msg.tasks.len();
+     let mut task_updates = TaskUpdates::new();
+     let remaining_time = state.remaining_time();
+@@ -81,6 +86,10 @@
+     mut allocation: Rc<Allocation>,
+     task_updates: &mut TaskUpdates,
+ ) -> bool {
++    if state.任务边界让位 {
++        state.allocator.release_allocation(allocation);
++        return false;
++    }
+     while let Some(task) = state
+         .prefilled_tasks
+         .get_mut(&resource_rq_id)
+@@ -231,7 +240,30 @@
+     } else {
+         task_future.await
+     };
++    let GPU任务 = {
++        let 状态 = state_ref.get();
++        状态.find_running_task(task_id).is_some_and(|任务| 状态.get_resource_map().get_index("gpus").is_some_and(|资源| 状态.resource_rq_map.get(任务.task.resource_rq_id).get(任务.rv_id).get_amount(资源).is_some_and(|数量| !数量.is_zero())))
++    };
++    let mut 请求让位 = false;
++    if GPU任务 && matches!(&result, Ok(TaskResult::Finished)) {
++        if let Ok(参数文本) = std::env::var("TASKCTL_TASK_BOUNDARY_COMMAND") {
++            match serde_json::from_str::<Vec<String>>(&参数文本) {
++                Ok(参数) if !参数.is_empty() => {
++                    let 工作者编号 = state_ref.get().worker_id.as_num();
++                    let mut 命令 = tokio::process::Command::new(&参数[0]);
++                    命令.args(&参数[1..]).arg("--工作者").arg(工作者编号.to_string()).arg("--已结束作业").arg(task_id.job_id().as_num().to_string()).kill_on_drop(true);
++                    match tokio::time::timeout(Duration::from_secs(120), 命令.status()).await {
++                        Ok(Ok(状态)) if 状态.code() == Some(75) => 请求让位 = true,
++                        Ok(Ok(状态)) if 状态.success() => {},
++                        结果 => log::error!("任务边界检查失败，保留节点：{结果:?}"),
++                    }
++                }
++                _ => log::error!("任务边界命令无效，保留节点"),
++            }
++        }
++    }
+     let mut state = state_ref.get_mut();
++    state.任务边界让位 |= 请求让位;
+     let rtask = state.remove_running_task(task_id).unwrap();
+     let resource_rq_id = rtask.task.resource_rq_id;
+     state.running_tasks.remove(&task_id);
+@@ -269,7 +301,7 @@
+         &mut task_updates,
+     );
+ 
+-    if !allocation_used && !state.blocked_requests.is_empty() {
++    if !state.任务边界让位 && !allocation_used && !state.blocked_requests.is_empty() {
+         let mut unblocked = Vec::new();
+ 
+         for (rq_id, rv_id) in &state.blocked_requests {
+@@ -292,4 +324,7 @@
+             .comm()
+             .send_message_to_server(FromWorkerMessage::TaskUpdate(task_updates));
+     }
++    if state.任务边界让位 && state.is_empty() {
++        state.任务边界退出.notify_one();
++    }
+ }
+--- a/crates/tako/src/internal/worker/state.rs
++++ b/crates/tako/src/internal/worker/state.rs
+@@ -27,6 +27,8 @@
+     pub(crate) blocked_requests: Set<(ResourceRqId, ResourceVariantId)>,
+     pub(crate) running_tasks: TaskMap,
+     pub(crate) prefilled_tasks: Map<ResourceRqId, Vec<Task>>,
++    pub(crate) 任务边界让位: bool,
++    pub(crate) 任务边界退出: std::rc::Rc<tokio::sync::Notify>,
+ 
+     pub(crate) worker_id: WorkerId,
+     pub(crate) worker_addresses: Map<WorkerId, String>,
+@@ -245,6 +247,8 @@
+             blocked_requests: Set::new(),
+             running_tasks: Default::default(),
+             prefilled_tasks: Default::default(),
++            任务边界让位: false,
++            任务边界退出: std::rc::Rc::new(tokio::sync::Notify::new()),
+             start_time: now,
+             resource_id_map: resource_map,
+             resource_rq_map,
+--- a/crates/tako/src/internal/worker/rpc.rs
++++ b/crates/tako/src/internal/worker/rpc.rs
+@@ -249,6 +249,7 @@
+         None => Either::Left(futures::future::pending::<()>()),
+         Some(d) => Either::Right(tokio::time::sleep(d)),
+     };
++    let 任务边界退出 = state_ref.get().任务边界退出.clone();
+     let future = async move {
+         let send_loop = forward_queue_to_sealed_sink(queue_receiver, sender, sealer);
+         tokio::pin! {
+@@ -272,6 +273,10 @@
+                 log::info!("Worker received an external stop notification");
+                 Ok(Some(FromWorkerMessage::Stop(WorkerStopReason::Interrupted)))
+             }
++            _ = 任务边界退出.notified() => {
++                log::info!("单任务已完成，为等待中的大卡释放本分配");
++                Ok(Some(FromWorkerMessage::Stop(WorkerStopReason::Interrupted)))
++            }
+             _ = heartbeat_fut => { unreachable!() }
+             _ = retract_check_fut => { unreachable!() }
+             _ = overview_fut => { unreachable!() }

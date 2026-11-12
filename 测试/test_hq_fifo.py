@@ -56,7 +56,7 @@ class NativeFifoTests(unittest.TestCase):
                             进程.wait(timeout=10)
                 服务.stdout.close()
 
-    def run_queue(self, tasks, memory, 显卡数=1):
+    def run_queue(self, tasks, memory, 显卡数=1, 边界返回码=None, 旧worker保护=False):
         binary = str(Path(os.environ["HQ_TEST_BINARY"]).resolve())
         with tempfile.TemporaryDirectory(prefix="hq-fifo-check-") as directory:
             environment = dict(os.environ, HQ_SERVER_DIR=str(Path(directory) / "server"))
@@ -82,20 +82,30 @@ class NativeFifoTests(unittest.TestCase):
                     self.fail("Native test server did not start")
                 submitted = []
                 for name, priority, requested in tasks:
+                    执行命令 = [sys.executable, str(Path(__file__).resolve().parents[1] / "GPUworker.py"), "--task", "/usr/bin/true"] if 旧worker保护 else ["/usr/bin/true"]
                     job_id = int(command(
                         "--output-mode=quiet", "submit", "--name=" + name,
                         "--priority=" + str(priority), "--cpus=1", "--resource=gpus=1",
                         "--resource=gpumem=" + str(requested),
                         "--stdout=" + directory + "/%{JOB_ID}.out",
-                        "--stderr=" + directory + "/%{JOB_ID}.err", "--", "/usr/bin/true"))
+                        "--stderr=" + directory + "/%{JOB_ID}.err", "--", *执行命令))
                     submitted.append((job_id, requested))
+                if 边界返回码 is not None:
+                    environment["TASKCTL_TASK_BOUNDARY_COMMAND"] = json.dumps([sys.executable, "-c", f"raise SystemExit({边界返回码})"])
+                if 旧worker保护:
+                    environment.update(SLURM_JOB_ID="test-boundary", TASKCTL_NATIVE_TASK_BOUNDARY="0", TASKCTL_GPU_MEMORY_GB=str(memory))
+                    environment["TASKCTL_TASK_BOUNDARY_COMMAND"] = json.dumps([sys.executable, "-c", 'import json,sys; 作业号=int(sys.argv[sys.argv.index("--已结束作业")+1]); print(json.dumps({"工作者":1})); raise SystemExit(75 if 作业号>1 else 0)'])
                 worker = subprocess.Popen(
                     [binary, "worker", "start", "--cpus=1", "--resource=gpus=[" + ",".join(map(str, range(显卡数))) + "]",
                      "--resource=gpumem=sum(" + str(memory * 显卡数) + ")", "--detect-resources=none",
                      "--idle-timeout=30s", "--time-limit=1m"], env=environment,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 runnable = [str(job_id) for job_id, requested in submitted if float(str(requested).split(":")[0]) <= memory]
+                if 边界返回码 == 75 or 旧worker保护:
+                    runnable = runnable[:1]
                 command("job", "wait", ",".join(runnable))
+                if 边界返回码 == 75 or 旧worker保护:
+                    self.assertEqual(worker.wait(timeout=10), 0)
                 details = json.loads(command("--output-mode=json", "job", "info",
                                              ",".join(str(job_id) for job_id, _ in submitted)))
                 finished = [detail for detail in details
@@ -124,6 +134,23 @@ class NativeFifoTests(unittest.TestCase):
         ], 80)
         self.assertEqual(order, ["high-later", "equal-first-small", "equal-later-large", "low-first"])
         self.assertEqual(waiting, ["oversized-highest"])
+
+    def test_任务边界退出先记成功且不执行下一任务(self):
+        顺序, 等待 = self.run_queue([("first-finished", 10, "22:44"), ("second-waiting", 10, "22:44")], 40, 边界返回码=75)
+        self.assertEqual(顺序, ["first-finished"])
+        self.assertEqual(等待, ["second-waiting"])
+
+    def test_任务边界保留或检查失败均继续运行(self):
+        for 返回码 in (0, 2):
+            with self.subTest(返回码=返回码):
+                顺序, 等待 = self.run_queue([("first", 10, "22:44"), ("second", 10, "22:44")], 40, 边界返回码=返回码)
+                self.assertEqual(顺序, ["first", "second"])
+                self.assertFalse(等待)
+
+    def test_旧worker在下一任务计算前释放并将该任务交回等待(self):
+        顺序, 等待 = self.run_queue([("first-finished", 10, "22:44"), ("second-not-started", 10, "22:44")], 40, 旧worker保护=True)
+        self.assertEqual(顺序, ["first-finished"])
+        self.assertEqual(等待, ["second-not-started"])
 
     def test_backfill_skips_oversized_high_priority_task(self):
         order, waiting = self.run_queue([
