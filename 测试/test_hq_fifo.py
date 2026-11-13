@@ -1,6 +1,7 @@
 """Opt-in native scheduling checks; only no-op tasks and virtual GPU resources."""
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -9,10 +10,61 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 
 @unittest.skipUnless(os.environ.get("HQ_TEST_BINARY"), "HQ_TEST_BINARY is required")
 class NativeFifoTests(unittest.TestCase):
+    def test_AF3通过真实HQ完成事件等待且正常关闭订阅(self):
+        二进制 = str(Path(os.environ["HQ_TEST_BINARY"]).resolve())
+        项目 = Path(__file__).resolve().parents[2] / "Optimize-peptide-sequences"
+        with tempfile.TemporaryDirectory(prefix="hq-event-check-") as 目录:
+            环境 = dict(os.environ, TASKCTL_STATE=目录, HQ_SERVER_DIR=str(Path(目录) / "server"), LD_LIBRARY_PATH="/public_bme2/Share200T/管吉松/envs/af3/lib:" + os.environ.get("LD_LIBRARY_PATH", ""))
+            服务 = subprocess.Popen([二进制, "server", "start", "--host=127.0.0.1"], env=环境, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            工作者 = None
+
+            def 查询(*参数):
+                结果 = subprocess.run([二进制, *参数], env=环境, capture_output=True, text=True, timeout=20)
+                self.assertEqual(结果.returncode, 0, 结果.stdout + 结果.stderr)
+                return 结果.stdout
+
+            try:
+                for 行 in 服务.stdout:
+                    if "Journal path" in 行:
+                        break
+                else:
+                    self.fail("隔离事件测试服务未启动")
+                编号 = int(查询("--output-mode=quiet", "submit", "--cpus=1", "--stdout=" + 目录 + "/task.out", "--stderr=" + 目录 + "/task.err", "--", "/usr/bin/true"))
+                规范 = importlib.util.spec_from_file_location("af3_event_integration", 项目 / "af3适配" / "af3任务.py")
+                适配器 = importlib.util.module_from_spec(规范)
+                with patch.dict(os.environ, 环境):
+                    规范.loader.exec_module(适配器)
+                    适配器.HQ程序 = 二进制
+                    适配器.queue_jobs = lambda: json.loads(查询("--output-mode=json", "job", "list", "--all"))
+                    状态记录 = []
+
+                    def 回调(作业):
+                        nonlocal 工作者
+                        状态记录.append(作业[0]["task_stats"].copy())
+                        if 工作者 is None:
+                            工作者 = subprocess.Popen([二进制, "worker", "start", "--cpus=1", "--detect-resources=none", "--idle-timeout=5s", "--time-limit=15s"], env=环境, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    with patch.object(适配器, "time", Mock(wraps=适配器.time)) as 时钟:
+                        适配器.wait([编号], on_poll=回调)
+                        时钟.sleep.assert_not_called()
+                    self.assertGreaterEqual(len(状态记录), 2)
+                    self.assertEqual(状态记录[-1].get("finished"), 1)
+            finally:
+                subprocess.run([二进制, "server", "stop"], env=环境, capture_output=True, timeout=10)
+                for 进程 in (工作者, 服务):
+                    if 进程 is not None:
+                        try:
+                            进程.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            进程.kill()
+                            进程.wait(timeout=10)
+                服务.stdout.close()
+
     def test_范围CLI_JSON与实际包装器端到端联动(self):
         原目录 = Path(__file__).resolve().parents[1]
         二进制 = str(Path(os.environ["HQ_TEST_BINARY"]).resolve())
