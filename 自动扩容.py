@@ -504,6 +504,8 @@ class Controller:
             arguments.append(f"--qos={qos}")
         if allocation.get("排除节点"):
             arguments.append("--exclude=" + ",".join(allocation["排除节点"]))
+        # 主节点 /tmp 的本地二进制不能传给其他节点；worker 启动时各自复制。
+        environment.pop("TASKCTL_HQ", None)
         脚本 = self.启动配置.get("作业脚本") if getattr(self, "启动模式", False) else str(HERE / "弹性worker.sh")
         if not 脚本 or not Path(脚本).is_file():
             raise ValueError("缺少可用的逐档启动作业脚本")

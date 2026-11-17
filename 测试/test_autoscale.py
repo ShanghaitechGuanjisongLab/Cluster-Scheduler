@@ -3,6 +3,7 @@
 import json
 import importlib.util
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -161,6 +162,7 @@ class GpuResourceTests(unittest.TestCase):
             for 文件名 in ("service.info", "stop.requested", "reload.requested"):
                 (状态目录 / 文件名).write_text("existing-owner", encoding="utf-8")
             shutil.copyfile(ROOT / "任务守护.sh", 根目录 / "任务守护.sh")
+            shutil.copyfile(ROOT / "bin" / "hq.native", 根目录 / "bin" / "hq.native")
             (根目录 / "弹性worker.sh").write_text('#!/bin/bash\nprintf "WORKER_ONLY:%s:%s\\n" "$TASKCTL_STATE" "$SLURM_CPUS_PER_TASK"\n', encoding="utf-8")
             执行器 = 根目录 / "bin" / "hq"
             执行器.write_text(f"#!{sys.executable}\nimport sys\nraise SystemExit(0 if sys.argv[1:3] == ['server', 'info'] else 7)\n", encoding="utf-8")
@@ -577,6 +579,45 @@ class PlanningTests(unittest.TestCase):
                  [AUTOSCALE.Request(17, 6, 1, 32, priority=27)])
         resources[-1]["request"] = {"显存范围": [325000, 650000]}
         self.assertEqual(AUTOSCALE.job_requests(detail), [AUTOSCALE.Request(17, 6, 1, 32.5, priority=27, 显存上限=65)])
+
+    def test_弹性节点不继承主节点的本地HQ路径(self):
+        controller = object.__new__(AUTOSCALE.Controller)
+        controller.env = {"TASKCTL_HQ": "/tmp/主节点私有/hq"}
+        controller.account = "test"
+        controller.启动模式 = False
+        controller.name = "test"
+        捕获 = {}
+
+        def 拦截(参数, 环境):
+            捕获.update(参数=参数, 环境=环境)
+            return "1"
+
+        controller.run = 拦截
+        with tempfile.TemporaryDirectory() as 目录:
+            controller.state = Path(目录)
+            controller.state.joinpath("逐档启动.json").write_text("{}", encoding="utf-8")
+            分配 = {"offer": AUTOSCALE.Offer("bme_gpu12", "bme_gpu", "A10080GB", 80, 0, 0, 0, (), 最长时限="5-00:00:00"),
+                    "cpus": 8, "gpus": 1, "gpu_memory": 80, "memory_mb": 32768,
+                    "job_id": 1, "priority": 20}
+            controller.submit(分配, None)
+        self.assertNotIn("TASKCTL_HQ", 捕获["环境"])
+        self.assertTrue(捕获["参数"][-1].endswith("弹性worker.sh"))
+
+    def test_守护隔离启动实际使用本地HQ副本(self):
+        with tempfile.TemporaryDirectory() as 目录:
+            环境 = dict(os.environ, TASKCTL_STATE=目录, TASKCTL_HOME=str(ROOT),
+                        TASKCTL_AUTOSCALE="0", TASKCTL_PYTHON=sys.executable,
+                        LD_LIBRARY_PATH="/public_bme2/Share200T/管吉松/envs/af3/lib:" + os.environ.get("LD_LIBRARY_PATH", ""))
+            命令 = "/usr/bin/python3 -c 'import os; from pathlib import Path; " \
+                   "Path(os.environ[\"TASKCTL_STATE\"] + \"/local.path\").write_text(os.environ[\"TASKCTL_HQ\"])'"
+            结果 = subprocess.run(["bash", str(ROOT / "任务守护.sh"), "--gpus", "none",
+                                   "--cpus", "1", "--run", 命令], env=环境,
+                                  text=True, capture_output=True, timeout=30)
+            self.assertEqual(结果.returncode, 0, 结果.stdout + 结果.stderr)
+            本地路径 = Path(Path(目录, "local.path").read_text())
+            self.assertTrue(str(本地路径).startswith(tempfile.gettempdir() + os.sep))
+            self.assertEqual(hashlib.sha256(本地路径.read_bytes()).digest(),
+                             hashlib.sha256(ROOT.joinpath("bin", "hq.native").read_bytes()).digest())
 
 
 if __name__ == "__main__":

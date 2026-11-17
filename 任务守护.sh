@@ -41,6 +41,19 @@ HQ_LIBSTDCPP="${HQ_LIBSTDCPP:-/public_bme2/Share200T/管吉松/envs/af3/lib}"
 if [[ -f "$HQ_LIBSTDCPP/libstdc++.so.6" ]]; then
     export LD_LIBRARY_PATH="$HQ_LIBSTDCPP${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+# 长期运行使用节点本地副本，减少共享盘可执行文件映射造成 SIGBUS 的风险。
+# 不在不同节点间传递 /tmp 路径；每个启动入口都在本节点复制。
+ensure_local_native() {
+    local source_file local_dir local_file version_output
+    source_file="${TASKCTL_NATIVE_LOCAL:-$HERE/bin/hq.native}"
+    local_dir="$(mktemp -d "${TMPDIR:-/tmp}/hq-native.XXXXXXXX")" || return 1
+    local_file="$local_dir/hq.native"
+    cp "$source_file" "$local_file" && chmod 700 "$local_file" || return 1
+    version_output="$("$local_file" --version)" || return 1
+    printf '%s\n' "$version_output" | grep -F 'hyperqueue' >/dev/null || return 1
+    export TASKCTL_HQ="$local_file"
+}
+ensure_local_native || { echo "❌ HQ 本地副本创建或校验失败，拒绝启动" >&2; exit 1; }
 STATE_DIR="${TASKCTL_STATE:-$HERE/运行状态}"
 export HQ_SERVER_DIR="$STATE_DIR/server"
 LOG_DIR="$STATE_DIR/logs"
