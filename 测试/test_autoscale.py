@@ -88,6 +88,46 @@ class 队列查询测试(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "服务离线"):
             QUEUE_QUERY.读取等待任务(失败查询)
 
+    def test_运行表显示节点显存和妥协优先级且不破坏等待表(self):
+        def 作业(编号, 名称, 优先级, 资源, 运行=1, worker=2):
+            return {"info": {"id": 编号, "name": 名称, "task_stats": {"running": 运行}},
+                    "tasks": [{"id": 0, "state": "running" if 运行 else "finished", "worker": worker}],
+                    "submits": [{"array": {"priority": 优先级, "resources": [{"resources": 资源}]}}]}
+
+        范围资源 = [{"resource": "gpus", "request": {"Compact": 10000}}, {"resource": "gpumem", "request": {"显存范围": [220000, 440000]}}]
+        CPU资源 = [{"resource": "cpus", "request": {"Compact": 60000}}]
+        详情 = [作业(2, "s000_asic1a", 21, 范围资源), 作业(1, "sp61-C搜索", 11, CPU资源), 作业(3, "已结束", 100, 范围资源, 运行=0)]
+        工作者 = [{"id": 2, "ended": None, "configuration": {"hostname": "bme_gpu13", "resources": {"resources": [{"name": "gpus", "kind": "list", "values": ["0"]}, {"name": "gpumem", "kind": "sum", "size": 800000}]}}}]
+        调用 = []
+
+        def 查询(*参数):
+            调用.append(参数)
+            if 参数[0] == "worker":
+                return 工作者
+            if 参数[1] == "list":
+                return [条目["info"] for 条目 in 详情]
+            return 详情
+
+        结果 = QUEUE_QUERY.读取运行任务(查询)
+        self.assertEqual([条目["作业号"] for 条目 in 结果], [2, 1])
+        self.assertEqual((结果[0]["节点"], 结果[0]["节点每卡显存GiB"], 结果[0]["妥协优先级"]), ("bme_gpu13", 80, 21))
+        self.assertIsNone(结果[1]["妥协优先级"])
+        self.assertIsNone(结果[1]["节点每卡显存GiB"])
+        文本 = QUEUE_QUERY.格式化运行(结果)
+        self.assertIn("bme_gpu13", 文本)
+        self.assertIn("22:44", 文本)
+        self.assertIn("CPU", 文本)
+        self.assertIn("共 2 个运行任务", 文本)
+        self.assertIn("没有运行任务", QUEUE_QUERY.格式化运行([]))
+
+        def 失败worker(*参数):
+            if 参数[0] == "worker":
+                raise RuntimeError("服务离线")
+            return 查询(*参数)
+
+        with self.assertRaisesRegex(RuntimeError, "服务离线"):
+            QUEUE_QUERY.读取运行任务(失败worker)
+
 
 class GpuResourceTests(unittest.TestCase):
     def test_旧worker边界查询异常不误停任务(self):
