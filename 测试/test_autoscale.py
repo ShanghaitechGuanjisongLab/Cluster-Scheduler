@@ -29,7 +29,7 @@ QUERY_SPEC.loader.exec_module(QUEUE_QUERY)
 
 class 队列查询测试(unittest.TestCase):
     def test_三列分别仅在出现非一值时显示且不修改原始记录(self):
-        基础记录 = {"作业号": 1, "任务名": "测试任务", "等待任务数": 1, "资源方案": 1, "GPU数": 1.0, "每卡显存下限GiB": 22, "每卡显存上限GiB": 44, "优先级": 21, "妥协优先级": 20}
+        基础记录 = {"作业号": 1, "任务名": "测试任务", "CPU数": 1, "等待任务数": 1, "资源方案": 1, "GPU数": 1.0, "每卡显存下限GiB": 22, "每卡显存上限GiB": 44, "优先级": 21, "妥协优先级": 20}
         可选列 = ("等待数", "方案", "GPU数")
         for 字段, 数值, 期望列 in ((None, None, ()), ("等待任务数", 2, ("等待数",)), ("资源方案", 2, ("方案",)), ("GPU数", 2, ("GPU数",)), ("GPU数", 0, ("GPU数",))):
             with self.subTest(字段=字段, 数值=数值):
@@ -41,6 +41,7 @@ class 队列查询测试(unittest.TestCase):
                 for 列 in 可选列:
                     self.assertEqual(列 in 表头, 列 in 期望列)
                 self.assertIn("显存范围(GiB/卡)", 表头)
+                self.assertIn("CPU核数", 表头)
                 self.assertIn("优先级", 表头)
                 self.assertEqual(json.dumps(记录列表), 原数据)
 
@@ -66,6 +67,7 @@ class 队列查询测试(unittest.TestCase):
         self.assertEqual(结果[1]["妥协优先级"], 20)
         self.assertIsNone(结果[0]["妥协优先级"])
         self.assertEqual(结果[2]["GPU数"], 0)
+        self.assertEqual(结果[2]["CPU数"], 1)
         文本 = QUEUE_QUERY.格式化队列(结果)
         self.assertIn("32.5:65", 文本)
         self.assertIn("CPU", 文本)
@@ -113,8 +115,10 @@ class 队列查询测试(unittest.TestCase):
         self.assertEqual((结果[0]["节点"], 结果[0]["节点每卡显存GiB"], 结果[0]["妥协优先级"]), ("bme_gpu13", 80, 21))
         self.assertIsNone(结果[1]["妥协优先级"])
         self.assertIsNone(结果[1]["节点每卡显存GiB"])
+        self.assertEqual((结果[0]["CPU数"], 结果[1]["CPU数"]), (1, 6))
         文本 = QUEUE_QUERY.格式化运行(结果)
         self.assertIn("bme_gpu13", 文本)
+        self.assertIn("CPU核数", 文本)
         self.assertIn("22:44", 文本)
         self.assertIn("CPU", 文本)
         self.assertIn("共 2 个运行任务", 文本)

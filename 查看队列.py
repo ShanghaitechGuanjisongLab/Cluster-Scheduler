@@ -53,11 +53,12 @@ def 读取等待任务(查询=查询HQ):
         for 方案编号, 方案 in enumerate(数组.get("resources", []), 1):
             资源 = {条目["resource"]: 条目 for 条目 in 方案.get("resources", [])}
             显卡数 = resource_amount(资源["gpus"]) if "gpus" in 资源 else 0
+            CPU数 = resource_amount(资源["cpus"]) if "cpus" in 资源 else 1
             显存值 = next(iter(资源.get("gpumem", {}).get("request", {}).values()), 0)
             总下限, 总上限 = 显存值 if isinstance(显存值, list) else (显存值, 显存值)
             下限, 上限 = 解析显存范围((总下限 / RESOURCE_SCALE / 显卡数, 总上限 / RESOURCE_SCALE / 显卡数)) if 显卡数 else (0, 0)
             妥协优先级 = 显存优先级(优先级, (下限, 上限), 下限) if 0 < 下限 < 上限 else None
-            记录列表.append({"作业号": 信息["id"], "任务名": 信息["name"], "等待任务数": 等待数, "资源方案": 方案编号, "GPU数": 显卡数 if 下限 else 0, "每卡显存下限GiB": 下限, "每卡显存上限GiB": 上限, "优先级": 优先级, "妥协优先级": 妥协优先级})
+            记录列表.append({"作业号": 信息["id"], "任务名": 信息["name"], "CPU数": CPU数, "等待任务数": 等待数, "资源方案": 方案编号, "GPU数": 显卡数 if 下限 else 0, "每卡显存下限GiB": 下限, "每卡显存上限GiB": 上限, "优先级": 优先级, "妥协优先级": 妥协优先级})
         if not 数组.get("resources"):
             raise ValueError(f"作业 {信息['id']} 没有资源方案")
     return sorted(记录列表, key=lambda 记录: (-记录["优先级"], 记录["作业号"], 记录["资源方案"]))
@@ -87,6 +88,7 @@ def 读取运行任务(查询=查询HQ):
             raise ValueError(f"作业 {信息['id']} 有多个资源方案，无法准确归属运行任务")
         资源 = {条目["resource"]: 条目 for 条目 in 数组["resources"][0].get("resources", [])}
         显卡数 = resource_amount(资源["gpus"]) if "gpus" in 资源 else 0
+        CPU数 = resource_amount(资源["cpus"]) if "cpus" in 资源 else 1
         显存值 = next(iter(资源.get("gpumem", {}).get("request", {}).values()), 0)
         总下限, 总上限 = 显存值 if isinstance(显存值, list) else (显存值, 显存值)
         下限, 上限 = 解析显存范围((总下限 / RESOURCE_SCALE / 显卡数, 总上限 / RESOURCE_SCALE / 显卡数)) if 显卡数 else (0, 0)
@@ -97,7 +99,7 @@ def 读取运行任务(查询=查询HQ):
             容量 = worker_capacity(工作者)
             每卡 = 容量.get("gpumem", 0) / max(1, 容量.get("gpus", 0)) if 显卡数 else 0
             妥协优先级 = 显存优先级(优先级, (下限, 上限), 每卡) if 0 < 下限 < 上限 and 每卡 else None
-            记录列表.append({"作业号": 信息["id"], "任务名": 信息["name"], "运行任务数": len(运行任务), "GPU数": 显卡数 if 下限 else 0,
+            记录列表.append({"作业号": 信息["id"], "任务名": 信息["name"], "CPU数": CPU数, "运行任务数": len(运行任务), "GPU数": 显卡数 if 下限 else 0,
                              "每卡显存下限GiB": 下限, "每卡显存上限GiB": 上限,
                              "节点": 工作者["configuration"]["hostname"], "节点每卡显存GiB": 每卡 if 显卡数 else None,
                              "优先级": 优先级, "妥协优先级": 妥协优先级})
@@ -107,12 +109,12 @@ def 读取运行任务(查询=查询HQ):
 def 格式化运行(记录列表):
     if not 记录列表:
         return "HQ 当前没有运行任务。"
-    表格 = [["HQ ID", "任务名", "节点", "显存(GiB/卡)", "显存范围(GiB/卡)", "优先级", "妥协优先级"]]
+    表格 = [["HQ ID", "任务名", "节点", "CPU核数", "显存(GiB/卡)", "显存范围(GiB/卡)", "优先级", "妥协优先级"]]
     for 记录 in 记录列表:
         显存 = f"{记录['节点每卡显存GiB']:g}" if 记录["GPU数"] else "CPU"
         范围 = f"{记录['每卡显存下限GiB']:g}:{记录['每卡显存上限GiB']:g}" if 记录["GPU数"] else "CPU"
         妥协 = str(记录["妥协优先级"]) if 记录["妥协优先级"] is not None else "不适用"
-        表格.append([str(记录["作业号"]), 记录["任务名"], 记录["节点"], 显存, 范围, str(记录["优先级"]), 妥协])
+        表格.append([str(记录["作业号"]), 记录["任务名"], 记录["节点"], f"{记录['CPU数']:g}", 显存, 范围, str(记录["优先级"]), 妥协])
 
     def 显示宽度(文本):
         return sum(2 if unicodedata.east_asian_width(字符) in ("W", "F") else 1 for 字符 in 文本)
@@ -126,11 +128,11 @@ def 格式化运行(记录列表):
 def 格式化队列(记录列表):
     if not 记录列表:
         return "HQ 当前没有等待任务。"
-    表格 = [["HQ ID", "任务名", "等待数", "方案", "GPU数", "显存范围(GiB/卡)", "优先级", "妥协优先级"]]
+    表格 = [["HQ ID", "任务名", "等待数", "方案", "GPU数", "CPU核数", "显存范围(GiB/卡)", "优先级", "妥协优先级"]]
     for 记录 in 记录列表:
         显存 = f"{记录['每卡显存下限GiB']:g}:{记录['每卡显存上限GiB']:g}" if 记录["GPU数"] else "CPU"
         妥协 = str(记录["妥协优先级"]) if 记录["妥协优先级"] is not None else "不适用"
-        表格.append([str(记录["作业号"]), 记录["任务名"], str(记录["等待任务数"]), str(记录["资源方案"]), f"{记录['GPU数']:g}", 显存, str(记录["优先级"]), 妥协])
+        表格.append([str(记录["作业号"]), 记录["任务名"], str(记录["等待任务数"]), str(记录["资源方案"]), f"{记录['GPU数']:g}", f"{记录['CPU数']:g}", 显存, str(记录["优先级"]), 妥协])
 
     可选列 = {2: "等待任务数", 3: "资源方案", 4: "GPU数"}
     显示列 = [列 for 列 in range(len(表格[0])) if 列 not in 可选列 or any(记录[可选列[列]] != 1 for 记录 in 记录列表)]
