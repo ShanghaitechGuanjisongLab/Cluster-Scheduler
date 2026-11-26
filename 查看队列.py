@@ -154,6 +154,25 @@ def 格式化队列(记录列表):
     return "\n".join(行列表)
 
 
+def Slurm排队摘要():
+    """HQ server 未运行时（作业还在 Slurm 排队），给出排队作业与预计开始。"""
+    try:
+        结果 = subprocess.run(["squeue", "--start", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j|%T|%S|%r"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "（无法查询 Slurm 排队情况）"
+    if 结果.returncode or not 结果.stdout.strip():
+        return "Slurm 中没有本账号的排队作业；看门狗（每 5 分钟）会自动补交。"
+    行列表 = ["HQ 主服务尚未启动：计算作业还在 Slurm 排队，排到后 HQ 自动恢复。", "当前排队作业："]
+    for 行 in 结果.stdout.strip().splitlines():
+        字段 = 行.split("|")
+        if len(字段) != 5:
+            continue
+        编号, 名称, 状态, 预计, 原因 = 字段
+        预计 = 预计 if 预计 not in ("N/A", "Unknown") else "未知"
+        行列表.append(f"  {编号}  {名称}  {状态}  预计开始:{预计}  原因:{原因}")
+    return "\n".join(行列表)
+
+
 def 主程序():
     参数解析 = argparse.ArgumentParser(description=__doc__)
     参数解析.add_argument("--状态目录", type=Path, help="共享状态目录，默认遵循 TASKCTL_STATE 或 HQ_SERVER_DIR")
@@ -164,6 +183,10 @@ def 主程序():
         运行列表 = 读取运行任务(查询)
         记录列表 = 读取等待任务(查询)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as 错误:
+        if "No running instance" in str(错误):
+            print("查询时间：" + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            print(Slurm排队摘要())
+            return 0
         print(f"查询失败：{错误}", file=sys.stderr)
         return 1
     if 参数.机器可读:

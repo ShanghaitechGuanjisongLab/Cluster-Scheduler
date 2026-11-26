@@ -185,7 +185,7 @@ class GpuResourceTests(unittest.TestCase):
             执行器.chmod(0o755)
             for 时限 in (None, "431880s"):
                 with self.subTest(时限=时限):
-                    环境 = dict(os.environ, TASKCTL_HOME=str(根目录), TASKCTL_STATE=str(根目录 / "运行状态"), CUDA_VISIBLE_DEVICES="0", SLURM_CPUS_PER_TASK="8")
+                    环境 = dict(os.environ, TASKCTL_HOME=str(根目录), TASKCTL_STATE=str(根目录 / "运行状态"), CUDA_VISIBLE_DEVICES="0", SLURM_CPUS_PER_TASK="8", TASKCTL_WORKER_WAIT_SERVER="0")
                     环境.pop("TASKCTL_WORKER_TIME_LIMIT", None)
                     if 时限:
                         环境["TASKCTL_WORKER_TIME_LIMIT"] = 时限
@@ -453,6 +453,45 @@ class PlanningTests(unittest.TestCase):
             结果 = 控制器.tick()
             self.assertEqual([(项["partition"], 项["gpu_memory"]) for 项 in 结果["plan"]], [("gpu", 40)])
             self.assertEqual(控制器.memory_mb, 32768)
+
+    def test_启动模式用编排脚本而普通扩容用纯worker(self):
+        with tempfile.TemporaryDirectory() as 目录:
+            状态 = Path(目录)
+            配置 = {"作业脚本": str(ROOT / "任务守护.sh"), "请求": [{"job_id": 1, "cpus": 6, "gpus": 1, "gpu_memory": 22, "显存上限": 44}], "环境": {}}
+            (状态 / "逐档启动.json").write_text(json.dumps(配置), encoding="utf-8")
+            控制器 = AUTOSCALE.Controller(state=状态, 启动模式=True)
+            提交记录 = []
+            def 录制提交(参数, 环境):
+                提交记录.append(参数)
+                return "4312412"
+            控制器.run = 录制提交
+            候选 = AUTOSCALE.Offer("node", "gpu", "A10040GB", 40, 8, 1, 32768, (), 最长时限="5-00:00:00")
+            分配 = {"offer": 候选, "cpus": 8, "gpus": 1.0, "memory_mb": 32768.0, "job_id": 1, "priority": 20}
+            self.assertEqual(控制器.submit(分配, ""), "4312412")
+            self.assertEqual(提交记录[-1][-1], str(ROOT / "任务守护.sh"))
+            控制器.启动模式 = False
+            self.assertEqual(控制器.submit(分配, ""), "4312412")
+            self.assertEqual(提交记录[-1][-1], str(ROOT / "弹性worker.sh"))
+
+    def test_弹性worker冷启动等待server出现(self):
+        with tempfile.TemporaryDirectory() as 目录:
+            根目录 = Path(目录)
+            (根目录 / "bin").mkdir()
+            执行器 = 根目录 / "bin" / "hq"
+            执行器.write_text(f"#!{sys.executable}\nprint(\"[]\")\n", encoding="utf-8")
+            执行器.chmod(0o755)
+            状态 = 根目录 / "运行状态"
+            环境 = dict(os.environ, TASKCTL_HOME=str(根目录), TASKCTL_STATE=str(状态), CUDA_VISIBLE_DEVICES="0", SLURM_CPUS_PER_TASK="8", TASKCTL_WORKER_WAIT_SERVER_SEC="3")
+            环境.pop("TASKCTL_WORKER_TIME_LIMIT", None)
+            # server 未出现 → 超时退出非零，而非立即失败或永远挂起
+            结果 = subprocess.run(["bash", str(ROOT / "弹性worker.sh")], env=环境, capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(结果.returncode, 0)
+            self.assertIn("等待 HQ server 超时", 结果.stderr)
+            # server 出现后 → 正常进入 worker start
+            (状态 / "server" / "001").mkdir(parents=True)
+            (状态 / "server" / "001" / "access.json").write_text("{}")
+            结果 = subprocess.run(["bash", str(ROOT / "弹性worker.sh")], env=环境, capture_output=True, text=True, timeout=15)
+            self.assertEqual(结果.returncode, 0, 结果.stderr)
 
     def test_逐档申请从刚好高于最大上限的档位向下且每档一次(self):
         节点 = [AUTOSCALE.Offer(str(显存), "gpu", f"GPU{显存}GB", 显存, 0, 0, 0, ("gpu",)) for 显存 in (16, 24, 32, 40, 80, 128)]

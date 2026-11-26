@@ -179,10 +179,16 @@ trap cleanup TERM INT EXIT
 # ---- 启动 server ----
 # 先判是否已有活 server（复用则不接管它的生命周期），没有就清掉陈旧实例目录再启。
 # 必要性：hq server 见到残留 access.json 会直接报 `File exists (os error 17)` 拒绝启动 → taskd 跟着退出 → 单任务能力永久丢失，只剩整包直跑（2026-10-20 实测踩到）；作业被 SLURM 掐断时 server 不会优雅退出，而看门狗每 5 天续交一次，故此清理是常态路径而非兜底。
+# 注意：此刻已持有 server.owner.lock。若 server info 因网络抖动误报离线而旧 server
+# 实际仍在运行（共享盘上其他节点的编排正连着它），rm -rf 会拆掉活账本 → 全员
+# “HQ 队列缺少待等待任务”崩溃。故 info 失败时再复核一次并短暂等待，仍失败才清理。
 SERVER_OWNED=0
 if "$HQ" server info >/dev/null 2>&1; then
     echo "♻️  检测到已有 HQ server，直接复用（退出时不关它）"
 else
+    if "$HQ" server info >/dev/null 2>&1; then
+        echo "♻️  复核发现 HQ server 在线（首次探测抖动），直接复用"
+    else
     rm -rf "$HQ_SERVER_DIR"/* 2>/dev/null
     # 注意：hq 0.20 起把 access.json 写在实例子目录下（运行状态/server/001/access.json），故就绪判据用 glob 匹配任意实例，不能直接查 server 根目录。
     access_ready() { compgen -G "$HQ_SERVER_DIR/*/access.json" >/dev/null; }
@@ -195,6 +201,7 @@ else
         sleep 0.5
     done
     access_ready || { echo "❌ server 未就绪" >&2; exit 1; }
+    fi
 fi
 echo "✅ HQ server 就绪${SERVER_PID:+ (pid=$SERVER_PID)}"
 
